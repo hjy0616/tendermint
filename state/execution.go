@@ -550,3 +550,67 @@ func ExecCommitBlock(
 	// ResponseCommit has no error or log, just data
 	return res.Data, nil
 }
+
+// EVMContext는 EVM 실행 환경에 대한 컨텍스트 정보를 제공합니다.
+type EVMContext struct {
+	BlockNumber     int64
+	BlockTime       time.Time
+	GasLimit        int64
+	ChainID         string
+	BlockHash       []byte
+	TransactionHash []byte
+}
+
+// EVMStateDB는 이더리움 상태 접근을 위한 인터페이스입니다.
+type EVMStateDB interface {
+	// 계정 정보 조회 및 설정
+	CreateAccount(address []byte)
+	GetBalance(address []byte) []byte
+	SetBalance(address []byte, amount []byte)
+	GetNonce(address []byte) uint64
+	SetNonce(address []byte, nonce uint64)
+	GetCodeHash(address []byte) []byte
+	GetCode(address []byte) []byte
+	SetCode(address []byte, code []byte)
+	GetCodeSize(address []byte) int
+
+	// 스토리지 접근
+	GetState(address []byte, key []byte) []byte
+	SetState(address []byte, key []byte, value []byte)
+
+	// 로그 및 이벤트
+	AddLog(log *EVMLog)
+	AddPreimage(hash []byte, preimage []byte)
+
+	// 상태 관리
+	Snapshot() int
+	RevertToSnapshot(snapshot int)
+	Commit() ([]byte, error)
+}
+
+// EVMLog는 EVM 실행 중 생성된 로그 데이터를 저장합니다.
+type EVMLog struct {
+	Address     []byte
+	Topics      [][]byte
+	Data        []byte
+	BlockNumber int64
+	TxHash      []byte
+	TxIndex     uint
+	BlockHash   []byte
+	Index       uint
+}
+
+// EVMExecutor는 EVM 트랜잭션을 실행하는 인터페이스입니다.
+type EVMExecutor interface {
+	Execute(ctx EVMContext, stateDB EVMStateDB, tx []byte) ([]byte, uint64, error)
+}
+
+// DeliverEVMTx는 EVM 트랜잭션을 실행하고 상태를 업데이트합니다.
+func DeliverEVMTx(
+	executor EVMExecutor,
+	ctx EVMContext,
+	stateDB EVMStateDB,
+	tx []byte,
+) ([]byte, uint64, error) {
+	return executor.Execute(ctx, stateDB, tx)
+}
