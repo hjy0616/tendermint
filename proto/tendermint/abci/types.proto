@@ -75,14 +75,10 @@ message RequestQuery {
 }
 
 message RequestBeginBlock {
-  bytes             hash                     = 1;
-  tendermint.types.Header  header           = 2 [(gogoproto.nullable) = false];
-  LastCommitInfo    last_commit_info         = 3 [(gogoproto.nullable) = false];
-  repeated Evidence byzantine_validators     = 4;
-  // Ethereum 통합을 위한 필드
-  bytes             parent_state_root        = 5; // 이전 블록의 상태 루트 해시
-  bytes             transaction_root         = 6; // 이전 블록의 트랜잭션 루트 해시
-  bytes             receipts_root            = 7; // 이전 블록의 영수증 루트 해시
+  bytes                   hash                 = 1;
+  tendermint.types.Header header               = 2 [(gogoproto.nullable) = false];
+  LastCommitInfo          last_commit_info     = 3 [(gogoproto.nullable) = false];
+  repeated Evidence       byzantine_validators = 4 [(gogoproto.nullable) = false];
 }
 
 enum CheckTxType {
@@ -201,10 +197,8 @@ message ResponseQuery {
 }
 
 message ResponseBeginBlock {
-  repeated Event events = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "events,omitempty"];
-  // Ethereum 통합을 위한 필드
-  bytes current_state_root = 2; // 현재 블록의 상태 루트 해시(초기값)
-  bool is_evm_execution_enabled = 3; // EVM 실행 활성화 여부
+  repeated Event events = 1
+      [(gogoproto.nullable) = false, (gogoproto.jsontag) = "events,omitempty"];
 }
 
 message ResponseCheckTx {
@@ -226,21 +220,17 @@ message ResponseCheckTx {
 }
 
 message ResponseDeliverTx {
-  uint32            code                     = 1;
-  bytes             data                     = 2;
-  string            log                      = 3;  // nondeterministic
-  string            info                     = 4;  // nondeterministic
-  int64             gas_wanted               = 5 [json_name = "gas_wanted"];
-  int64             gas_used                 = 6 [json_name = "gas_used"];
-  repeated Event    events                  = 7 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "events,omitempty"];
-  string            codespace               = 8;
-  // Ethereum 통합을 위한 필드
-  bytes             evm_return_data         = 9;  // EVM 실행 결과 데이터
-  bytes             evm_state_root          = 10; // 트랜잭션 실행 후 상태 루트
-  bytes             evm_tx_hash             = 11; // 이더리움 트랜잭션 해시
-  bytes             evm_contract_address    = 12; // 생성된 계약 주소(컨트랙트 배포시)
-  repeated bytes    evm_logs                = 13; // EVM 로그 데이터
-  bool              evm_status              = 14; // 트랜잭션 성공 여부
+  uint32         code       = 1;
+  bytes          data       = 2;
+  string         log        = 3;  // nondeterministic
+  string         info       = 4;  // nondeterministic
+  int64          gas_wanted = 5 [json_name = "gas_wanted"];
+  int64          gas_used   = 6 [json_name = "gas_used"];
+  repeated Event events     = 7 [
+    (gogoproto.nullable) = false,
+    (gogoproto.jsontag)  = "events,omitempty"
+  ];  // nondeterministic
+  string codespace = 8;
 }
 
 message ResponseEndBlock {

@@ -77,9 +77,6 @@ type Config struct {
 	Storage         *StorageConfig         `mapstructure:"storage"`
 	TxIndex         *TxIndexConfig         `mapstructure:"tx_index"`
 	Instrumentation *InstrumentationConfig `mapstructure:"instrumentation"`
-
-	// EVM은 EVM 관련 설정을 포함합니다.
-	EVM *EVMConfig `mapstructure:"evm"`
 }
 
 // DefaultConfig returns a default configuration for a Tendermint node
@@ -95,20 +92,23 @@ func DefaultConfig() *Config {
 		Storage:         DefaultStorageConfig(),
 		TxIndex:         DefaultTxIndexConfig(),
 		Instrumentation: DefaultInstrumentationConfig(),
-		EVM:             DefaultEVMConfig(),
 	}
 }
 
 // TestConfig returns a configuration that can be used for testing
 func TestConfig() *Config {
-	cfg := DefaultConfig()
-
-	// 테스트 환경에서 EVM 설정 조정
-	cfg.EVM.Enabled = true
-	cfg.EVM.ChainID = 1337   // 테스트 체인 ID
-	cfg.EVM.StateDBPath = "" // 인메모리 DB 사용
-
-	return cfg
+	return &Config{
+		BaseConfig:      TestBaseConfig(),
+		RPC:             TestRPCConfig(),
+		P2P:             TestP2PConfig(),
+		Mempool:         TestMempoolConfig(),
+		StateSync:       TestStateSyncConfig(),
+		FastSync:        TestFastSyncConfig(),
+		Consensus:       TestConsensusConfig(),
+		Storage:         TestStorageConfig(),
+		TxIndex:         TestTxIndexConfig(),
+		Instrumentation: TestInstrumentationConfig(),
+	}
 }
 
 // SetRoot sets the RootDir for all Config structs
@@ -148,20 +148,6 @@ func (cfg *Config) ValidateBasic() error {
 	if err := cfg.Instrumentation.ValidateBasic(); err != nil {
 		return fmt.Errorf("error in [instrumentation] section: %w", err)
 	}
-
-	// EVM 설정 검증
-	if cfg.EVM.Enabled {
-		if cfg.EVM.ChainID <= 0 {
-			return errors.New("evm.chain_id must be positive")
-		}
-		if cfg.EVM.GasLimit <= 0 {
-			return errors.New("evm.gas_limit must be positive")
-		}
-		if cfg.EVM.TargetBlockTime <= 0 {
-			return errors.New("evm.target_block_time must be positive")
-		}
-	}
-
 	return nil
 }
 
@@ -933,6 +919,9 @@ type ConsensusConfig struct {
 	WalPath string `mapstructure:"wal_file"`
 	walFile string // overrides WalPath if set
 
+	// Use voting power based weighted proposer selection instead of the default priority based method
+	UseWeightedProposerSelection bool `mapstructure:"use_weighted_proposer_selection"`
+
 	// How long we wait for a proposal block before prevoting nil
 	TimeoutPropose time.Duration `mapstructure:"timeout_propose"`
 	// How much timeout_propose increases with each round
@@ -968,20 +957,21 @@ type ConsensusConfig struct {
 // DefaultConsensusConfig returns a default configuration for the consensus service
 func DefaultConsensusConfig() *ConsensusConfig {
 	return &ConsensusConfig{
-		WalPath:                     filepath.Join(defaultDataDir, "cs.wal", "wal"),
-		TimeoutPropose:              3000 * time.Millisecond,
-		TimeoutProposeDelta:         500 * time.Millisecond,
-		TimeoutPrevote:              1000 * time.Millisecond,
-		TimeoutPrevoteDelta:         500 * time.Millisecond,
-		TimeoutPrecommit:            1000 * time.Millisecond,
-		TimeoutPrecommitDelta:       500 * time.Millisecond,
-		TimeoutCommit:               1000 * time.Millisecond,
-		SkipTimeoutCommit:           false,
-		CreateEmptyBlocks:           true,
-		CreateEmptyBlocksInterval:   0 * time.Second,
-		PeerGossipSleepDuration:     100 * time.Millisecond,
-		PeerQueryMaj23SleepDuration: 2000 * time.Millisecond,
-		DoubleSignCheckHeight:       int64(0),
+		WalPath:                      filepath.Join(defaultDataDir, "cs.wal", "wal"),
+		TimeoutPropose:               3000 * time.Millisecond,
+		TimeoutProposeDelta:          500 * time.Millisecond,
+		TimeoutPrevote:               1000 * time.Millisecond,
+		TimeoutPrevoteDelta:          500 * time.Millisecond,
+		TimeoutPrecommit:             1000 * time.Millisecond,
+		TimeoutPrecommitDelta:        500 * time.Millisecond,
+		TimeoutCommit:                1000 * time.Millisecond,
+		SkipTimeoutCommit:            false,
+		CreateEmptyBlocks:            true,
+		CreateEmptyBlocksInterval:    0 * time.Second,
+		PeerGossipSleepDuration:      100 * time.Millisecond,
+		PeerQueryMaj23SleepDuration:  2000 * time.Millisecond,
+		DoubleSignCheckHeight:        0,
+		UseWeightedProposerSelection: false,
 	}
 }
 
@@ -999,7 +989,8 @@ func TestConsensusConfig() *ConsensusConfig {
 	cfg.SkipTimeoutCommit = true
 	cfg.PeerGossipSleepDuration = 5 * time.Millisecond
 	cfg.PeerQueryMaj23SleepDuration = 250 * time.Millisecond
-	cfg.DoubleSignCheckHeight = int64(0)
+	cfg.DoubleSignCheckHeight = 0
+	cfg.UseWeightedProposerSelection = true
 	return cfg
 }
 
@@ -1228,37 +1219,4 @@ func getDefaultMoniker() string {
 		moniker = "anonymous"
 	}
 	return moniker
-}
-
-// EVMConfig는 이더리움 호환 설정을 정의합니다.
-type EVMConfig struct {
-	// Enabled는 EVM 모드 활성화 여부입니다.
-	Enabled bool `mapstructure:"enabled"`
-
-	// ChainID는 이더리움 체인 ID입니다.
-	ChainID int64 `mapstructure:"chain_id"`
-
-	// GasLimit는 블록당 최대 가스 한도입니다.
-	GasLimit int64 `mapstructure:"gas_limit"`
-
-	// TargetBlockTime은 블록 생성 목표 시간(초)입니다.
-	TargetBlockTime int `mapstructure:"target_block_time"`
-
-	// StakingContract는 스테이킹 컨트랙트 주소입니다.
-	StakingContract string `mapstructure:"staking_contract"`
-
-	// StateDBPath는 상태 데이터베이스 경로입니다.
-	StateDBPath string `mapstructure:"statedb_path"`
-}
-
-// DefaultEVMConfig는 EVM 관련 기본 설정을 반환합니다.
-func DefaultEVMConfig() *EVMConfig {
-	return &EVMConfig{
-		Enabled:         false,
-		ChainID:         1,
-		GasLimit:        30000000,
-		TargetBlockTime: 2,
-		StakingContract: "",
-		StateDBPath:     "data/evmstate",
-	}
 }

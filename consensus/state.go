@@ -14,7 +14,6 @@ import (
 
 	cfg "github.com/tendermint/tendermint/config"
 	cstypes "github.com/tendermint/tendermint/consensus/types"
-	vs "github.com/tendermint/tendermint/consensus/validator_selection"
 	"github.com/tendermint/tendermint/crypto"
 	tmevents "github.com/tendermint/tendermint/libs/events"
 	"github.com/tendermint/tendermint/libs/fail"
@@ -976,26 +975,23 @@ func (cs *State) handleTxsAvailable() {
 // NOTE: cs.StartTime was already set for height.
 func (cs *State) enterNewRound(height int64, round int32) {
 	logger := cs.Logger.With("height", height, "round", round)
-
-	if cs.Height != height || round < cs.Round || (cs.Round == round && cs.Step != cstypes.RoundStepNewHeight) {
-		logger.Debug(
-			"entering new round with invalid args",
-			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
-		)
-		return
-	}
-
-	if now := tmtime.Now(); cs.StartTime.After(now) {
-		logger.Debug("need to set a buffer and log message here for sanity", "start_time", cs.StartTime, "now", now)
-	}
-
 	logger.Debug("entering new round", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
 
 	// increment validators if necessary
 	validators := cs.Validators
 	if cs.Round < round {
 		validators = validators.Copy()
-		validators.IncrementProposerPriority(tmmath.SafeSubInt32(round, cs.Round))
+
+		// Use new weighted selection algorithm instead of incrementing proposer priority
+		// This will select a proposer based on voting power and deterministic randomness
+		if cs.config.UseWeightedProposerSelection {
+			// Do not increment proposer priority, as we'll use the weighted selection method
+			// Just set the proposer using weighted selection
+			validators.Proposer = validators.SelectProposerWeighted(height, int64(round))
+		} else {
+			// Use the original proposer selection method
+			validators.IncrementProposerPriority(tmmath.SafeSubInt32(round, cs.Round))
+		}
 	}
 
 	// Setup new round
@@ -1119,113 +1115,55 @@ func (cs *State) enterPropose(height int64, round int32) {
 }
 
 func (cs *State) isProposer(address []byte) bool {
-	if cs.privValidatorPubKey == nil {
-		return false
+	if cs.config.UseWeightedProposerSelection {
+		// For weighted selection, we simply compare with the already selected proposer
+		return bytes.Equal(cs.Validators.GetProposer().Address, address)
+	} else {
+		// Original proposer selection logic
+		return bytes.Equal(cs.Validators.GetProposer().Address, address)
 	}
-
-	// 새로운 검증자 선택 로직 적용
-	proposer := vs.SelectProposer(cs.Validators, cs.Height, cs.Round, cs.Logger)
-	if proposer == nil {
-		return false
-	}
-
-	// 제안자 로깅
-	cs.Logger.Debug("Checking proposer",
-		"private_validator", cs.privValidator.GetPubKey().Address(),
-		"proposer", proposer.Address,
-		"current_height", cs.Height,
-		"current_round", cs.Round)
-
-	// 현재 노드가 제안자인지 확인
-	return bytes.Equal(proposer.Address, cs.privValidatorPubKey.Address())
 }
 
 func (cs *State) defaultDecideProposal(height int64, round int32) {
-	var proposer *types.Validator
+	var block *types.Block
+	var blockParts *types.PartSet
 
-	// EVM 지원을 위한 블록 생성 시간 조정: 고정된 시간 간격으로 블록을 생성하기 위한 로직
-	blockTime := cs.state.LastBlockTime
-	now := tmtime.Now()
-	switch {
-	case height == cs.state.InitialHeight:
-		// 첫 번째 블록은 현재 시간으로 설정
-		blockTime = now
-	case round == 0 && cs.state.ConsensusParams.Block.TimeIotaMs > 0:
-		// 라운드 0에서 블록 간격이 설정된 경우 일정 간격으로 블록 시간 증가
-		// 이더리움 호환성을 위한 조정: 고정된 블록 시간 간격 적용
-		targetBlockTime := blockTime.Add(time.Duration(cs.state.ConsensusParams.Block.TimeIotaMs) * time.Millisecond)
-		if now.After(targetBlockTime) {
-			blockTime = now
-		} else {
-			blockTime = targetBlockTime
-		}
-	default:
-		// 다른 모든 라운드는 현재 시간 사용
-		blockTime = now
-	}
-
-	// 새로운 검증자 선택 알고리즘 사용
-	if round == 0 {
-		// 라운드 0에서는 가중치 기반 선택
-		proposer = vs.SelectProposer(cs.Validators, height, round, cs.Logger)
+	// Decide on block
+	if cs.ValidBlock != nil {
+		// If there is valid block, choose that.
+		block, blockParts = cs.ValidBlock, cs.ValidBlockParts
 	} else {
-		// 다른 라운드에서는 이전 제안자 이후의 다음 검증자 순서대로 선택
-		var lastProposerAddress []byte
-		if cs.Validators.Size() > 0 {
-			lastProposerAddress = cs.Validators.GetProposer().Address
+		// Create a new proposal block from state/txs from the mempool.
+		block, blockParts = cs.createProposalBlock()
+		if block == nil {
+			return
 		}
-		proposer = vs.GetNextProposerRotation(cs.Validators, lastProposerAddress)
 	}
 
-	if proposer == nil {
-		cs.Logger.Error("defaultDecideProposal", "error", "proposer is nil")
-		return
+	// Flush the WAL. Otherwise, we may not recompute the same proposal to sign,
+	// and the privValidator will refuse to sign anything.
+	if err := cs.wal.FlushAndSync(); err != nil {
+		cs.Logger.Error("failed flushing WAL to disk")
 	}
 
-	// 현재 노드가 제안자인 경우 블록 생성
-	if cs.privValidatorPubKey != nil && bytes.Equal(proposer.Address, cs.privValidatorPubKey.Address()) {
-		cs.Logger.Info("defaultDecideProposal: this node is the proposer",
-			"height", height,
-			"round", round,
-			"proposer", proposer.Address.String())
-
-		cs.decideProposalAndUpdateMetrics(height, round, blockTime)
-	} else {
-		cs.Logger.Info("defaultDecideProposal: this node is not the proposer",
-			"height", height,
-			"round", round,
-			"proposer", proposer.Address.String())
-	}
-}
-
-// decideProposalAndUpdateMetrics는 블록 제안 로직과 메트릭 업데이트를 담당
-func (cs *State) decideProposalAndUpdateMetrics(height int64, round int32, blockTime time.Time) {
-	block, blockParts := cs.createProposalBlock(blockTime)
-	if block == nil {
-		cs.Logger.Error("Failed to create proposal block", "height", height, "round", round)
-		return
-	}
-
-	// 블록 서명 시간 조정
-	cs.Logger.Info("Proposing block", "height", height, "round", round, "timestamp", blockTime)
-	cs.getStartTimeWithPrevote("defaultDecideProposal_proposalCreated")
-
-	// PropBlockID를 블록 ID로 지정
-	blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: blockParts.Header()}
-	cs.BlockParts = blockParts
-
-	// 제안 생성
-	proposal := types.NewProposal(height, round, cs.ValidRound, blockID)
+	// Make proposal
+	propBlockID := types.BlockID{Hash: block.Hash(), PartSetHeader: blockParts.Header()}
+	proposal := types.NewProposal(height, round, cs.ValidRound, propBlockID)
 	p := proposal.ToProto()
 	if err := cs.privValidator.SignProposal(cs.state.ChainID, p); err == nil {
-		// Proposal 복원 및 파트 세트 설정
 		proposal.Signature = p.Signature
 
-		// 제안 전송
+		// send proposal and block parts on internal msg queue
 		cs.sendInternalMessage(msgInfo{&ProposalMessage{proposal}, ""})
-		cs.Logger.Info("Signed proposal", "height", height, "round", round, "proposal", proposal)
+
+		for i := 0; i < int(blockParts.Total()); i++ {
+			part := blockParts.GetPart(i)
+			cs.sendInternalMessage(msgInfo{&BlockPartMessage{cs.Height, cs.Round, part}, ""})
+		}
+
+		cs.Logger.Debug("signed proposal", "height", height, "round", round, "proposal", proposal)
 	} else if !cs.replayMode {
-		cs.Logger.Error("defaultDecideProposal", "err", err)
+		cs.Logger.Error("propose step; failed signing proposal", "height", height, "round", round, "err", err)
 	}
 }
 

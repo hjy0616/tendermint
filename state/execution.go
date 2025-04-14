@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,7 +13,6 @@ import (
 	tmstate "github.com/tendermint/tendermint/proto/tendermint/state"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	"github.com/tendermint/tendermint/proxy"
-	tmevents "github.com/tendermint/tendermint/state/events"
 	"github.com/tendermint/tendermint/types"
 )
 
@@ -270,111 +270,67 @@ func execBlockOnProxyApp(
 	dtxs := make([]*abci.ResponseDeliverTx, len(block.Txs))
 	abciResponses.DeliverTxs = dtxs
 
-	// 이더리움 상태 추적을 위한 변수들
-	var evmStateRoot []byte
-	var isEVMEnabled bool
-
 	// Execute transactions and get hash.
 	proxyCb := func(req *abci.Request, res *abci.Response) {
 		if r, ok := res.Value.(*abci.Response_DeliverTx); ok {
-			// 이더리움 상태 루트 추적
-			if r.DeliverTx.EvmStateRoot != nil && len(r.DeliverTx.EvmStateRoot) > 0 {
-				evmStateRoot = r.DeliverTx.EvmStateRoot
-			}
-
-			dtxs[txIndex] = r.DeliverTx
-			txIndex++
-
-			if r.DeliverTx.Code == abci.CodeTypeOK {
+			// TODO: make use of res.Log
+			// TODO: make use of this info
+			// Blocks may include invalid txs.
+			txRes := r.DeliverTx
+			if txRes.Code == abci.CodeTypeOK {
 				validTxs++
 			} else {
+				logger.Debug("invalid tx", "code", txRes.Code, "log", txRes.Log)
 				invalidTxs++
 			}
+
+			abciResponses.DeliverTxs[txIndex] = txRes
+			txIndex++
 		}
 	}
+	proxyAppConn.SetResponseCallback(proxyCb)
 
 	commitInfo := getBeginBlockValidatorInfo(block, store, initialHeight)
 
 	byzVals := make([]abci.Evidence, 0)
 	for _, evidence := range block.Evidence.Evidence {
-		byzVals = append(byzVals, abci.Evidence{
-			Type:             abci.EvidenceType(evidence.Type()),
-			Validator:        abci.Validator{Address: evidence.Address(), Power: evidence.Height()},
-			Height:           evidence.Height(),
-			Time:             evidence.Time(),
-			TotalVotingPower: evidence.TotalVotingPower(),
-		})
+		byzVals = append(byzVals, evidence.ABCI()...)
 	}
 
-	// EVM 통합을 위한 이전 블록 상태 루트 정보 추가
-	var parentStateRoot, transactionRoot, receiptsRoot []byte
-	if block.Height > initialHeight {
-		// 이전 블록에서 상태 루트 검색 (실제 구현에서는 이전 블록 상태 루트를 가져오는 로직 필요)
-		prevResponses, err := store.LoadABCIResponses(block.Height - 1)
-		if err == nil && prevResponses != nil && prevResponses.DeliverTxs != nil && len(prevResponses.DeliverTxs) > 0 {
-			// 마지막 트랜잭션의 상태 루트를 현재 블록의 부모 상태 루트로 사용
-			for i := len(prevResponses.DeliverTxs) - 1; i >= 0; i-- {
-				if prevResponses.DeliverTxs[i].EvmStateRoot != nil && len(prevResponses.DeliverTxs[i].EvmStateRoot) > 0 {
-					parentStateRoot = prevResponses.DeliverTxs[i].EvmStateRoot
-					break
-				}
-			}
-		}
-		// 트랜잭션 루트와 영수증 루트는 실제 구현에서 필요에 따라 추가
+	// Begin block
+	var err error
+	pbh := block.Header.ToProto()
+	if pbh == nil {
+		return nil, errors.New("nil header")
 	}
 
-	evsw := tmevents.NewEventSwitch()
-	evsw.Start()
-	defer evsw.Stop()
-
-	// BeginBlock 호출 시 EVM 관련 필드 전달
-	_, err := proxyAppConn.BeginBlockSync(abci.RequestBeginBlock{
+	abciResponses.BeginBlock, err = proxyAppConn.BeginBlockSync(abci.RequestBeginBlock{
 		Hash:                block.Hash(),
-		Header:              types.TM2PB.Header(&block.Header),
+		Header:              *pbh,
 		LastCommitInfo:      commitInfo,
 		ByzantineValidators: byzVals,
-		ParentStateRoot:     parentStateRoot, // 이전 블록의 상태 루트
-		TransactionRoot:     transactionRoot, // 이전 블록의 트랜잭션 루트
-		ReceiptsRoot:        receiptsRoot,    // 이전 블록의 영수증 루트
 	})
 	if err != nil {
+		logger.Error("error in proxyAppConn.BeginBlock", "err", err)
 		return nil, err
 	}
 
-	// BeginBlock 응답에서 EVM 활성화 여부 확인
-	res := proxyAppConn.BeginBlockSync(abci.RequestBeginBlock{
-		Hash:                block.Hash(),
-		Header:              types.TM2PB.Header(&block.Header),
-		LastCommitInfo:      commitInfo,
-		ByzantineValidators: byzVals,
-	})
-	if r, ok := res.Value.(*abci.Response_BeginBlock); ok {
-		abciResponses.BeginBlock = r.BeginBlock
-		// EVM 활성화 여부 확인
-		isEVMEnabled = r.BeginBlock.IsEvmExecutionEnabled
-		// 초기 상태 루트 설정
-		if r.BeginBlock.CurrentStateRoot != nil && len(r.BeginBlock.CurrentStateRoot) > 0 {
-			evmStateRoot = r.BeginBlock.CurrentStateRoot
+	// run txs of block
+	for _, tx := range block.Txs {
+		proxyAppConn.DeliverTxAsync(abci.RequestDeliverTx{Tx: tx})
+		if err := proxyAppConn.Error(); err != nil {
+			return nil, err
 		}
 	}
 
-	// Deliver Txs
-	for i, tx := range block.Txs {
-		proxyAppConn.DeliverTxAsync(abci.RequestDeliverTx{Tx: tx})
-		// EVM 처리 로직을 위한 추가 기능은 여기서 구현 가능
-	}
-
-	// End block
+	// End block.
 	abciResponses.EndBlock, err = proxyAppConn.EndBlockSync(abci.RequestEndBlock{Height: block.Height})
 	if err != nil {
+		logger.Error("error in proxyAppConn.EndBlock", "err", err)
 		return nil, err
 	}
 
-	logger.Info("executed block", "height", block.Height, "validTxs", validTxs, "invalidTxs", invalidTxs)
-	if isEVMEnabled {
-		logger.Info("EVM execution", "enabled", isEVMEnabled, "stateRoot", fmt.Sprintf("%X", evmStateRoot))
-	}
-
+	logger.Info("executed block", "height", block.Height, "num_valid_txs", validTxs, "num_invalid_txs", invalidTxs)
 	return abciResponses, nil
 }
 
