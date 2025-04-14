@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"sort"
 	"sync"
 
+	"github.com/tendermint/tendermint/abci/example/eireneapp/ethereum"
+	"github.com/tendermint/tendermint/abci/example/eireneapp/ethereum/rlp"
 	"github.com/tendermint/tendermint/abci/example/eireneapp/validators"
 	"github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/libs/log"
@@ -20,6 +24,7 @@ type EireneApp struct {
 	// 애플리케이션 상태
 	db           tmdb.DB                // 상태 저장용 데이터베이스
 	state        *AppState              // 애플리케이션 상태
+	ethState     *ethereum.State        // 이더리움 상태
 	valManager   *validators.Manager    // 검증자 관리자
 	currentBlock *BlockInfo             // 현재 처리 중인 블록 정보
 
@@ -27,12 +32,56 @@ type EireneApp struct {
 	txIndex    int64                    // 현재 블록 내 트랜잭션 인덱스
 	txResults  []*TxResult              // 현재 블록의 트랜잭션 결과
 	txMap      map[string]bool          // 트랜잭션 중복 검사용
+	mempoolTxs PriorityTxs              // 우선순위 기반 트랜잭션 큐
+
+	// 상태 롤백
+	stateSnapshots []*ethereum.State    // 상태 스냅샷 히스토리
 
 	// 동시성 제어
 	mtx        sync.Mutex               // 상태 액세스 뮤텍스
 
 	// 로깅
 	logger     log.Logger               // 로거
+}
+
+// PriorityTxs는 우선순위 기반 트랜잭션 큐입니다.
+type PriorityTxs struct {
+	txs       [][]byte   // 트랜잭션 데이터
+	priorities []int64   // 트랜잭션 우선순위 (가스 가격)
+}
+
+// Len은 PriorityTxs의 길이를 반환합니다. (sort.Interface 구현)
+func (pt *PriorityTxs) Len() int {
+	return len(pt.txs)
+}
+
+// Less는 i번째 요소가 j번째보다 우선순위가 높은지 확인합니다. (sort.Interface 구현)
+// 우선순위 값이 클수록 우선순위가 높습니다.
+func (pt *PriorityTxs) Less(i, j int) bool {
+	return pt.priorities[i] > pt.priorities[j]
+}
+
+// Swap은 요소를 교환합니다. (sort.Interface 구현)
+func (pt *PriorityTxs) Swap(i, j int) {
+	pt.txs[i], pt.txs[j] = pt.txs[j], pt.txs[i]
+	pt.priorities[i], pt.priorities[j] = pt.priorities[j], pt.priorities[i]
+}
+
+// Add는 트랜잭션을 우선순위 큐에 추가합니다.
+func (pt *PriorityTxs) Add(tx []byte, priority int64) {
+	pt.txs = append(pt.txs, tx)
+	pt.priorities = append(pt.priorities, priority)
+}
+
+// Sort는 우선순위 큐를 정렬합니다.
+func (pt *PriorityTxs) Sort() {
+	sort.Sort(pt)
+}
+
+// Clear는 우선순위 큐를 비웁니다.
+func (pt *PriorityTxs) Clear() {
+	pt.txs = pt.txs[:0]
+	pt.priorities = pt.priorities[:0]
 }
 
 // NewEireneApp는 새로운 EireneApp 인스턴스를 생성합니다.
@@ -49,13 +98,20 @@ func NewEireneApp(db tmdb.DB) *EireneApp {
 
 	logger := log.NewNopLogger()
 	valManager := validators.NewManager()
+	ethState := ethereum.NewState()
 
 	return &EireneApp{
 		db:         db,
 		state:      state,
+		ethState:   ethState,
 		valManager: valManager,
 		logger:     logger,
 		txMap:      make(map[string]bool),
+		mempoolTxs: PriorityTxs{
+			txs:       make([][]byte, 0),
+			priorities: make([]int64, 0),
+		},
+		stateSnapshots: make([]*ethereum.State, 0),
 	}
 }
 
@@ -163,6 +219,15 @@ func (app *EireneApp) BeginBlock(req types.RequestBeginBlock) types.ResponseBegi
 	app.txIndex = 0
 	app.txResults = make([]*TxResult, 0)
 	app.txMap = make(map[string]bool)
+	
+	// 현재 상태 스냅샷 저장
+	stateSnapshot := app.ethState.Copy()
+	app.stateSnapshots = append(app.stateSnapshots, stateSnapshot)
+	
+	// 스냅샷 관리 (최대 10개 유지)
+	if len(app.stateSnapshots) > 10 {
+		app.stateSnapshots = app.stateSnapshots[1:]
+	}
 
 	// 바이잔틴 검증자 처리
 	if len(req.ByzantineValidators) > 0 {
@@ -186,14 +251,14 @@ func (app *EireneApp) CheckTx(req types.RequestCheckTx) types.ResponseCheckTx {
 
 	// 중복 트랜잭션 검사
 	app.mtx.Lock()
+	defer app.mtx.Unlock()
+	
 	if app.txMap[txHashStr] {
-		app.mtx.Unlock()
 		return types.ResponseCheckTx{
 			Code: 2,
 			Log:  "duplicate transaction",
 		}
 	}
-	app.mtx.Unlock()
 
 	// 간단한 형식 검증
 	if len(req.Tx) < 2 {
@@ -205,8 +270,51 @@ func (app *EireneApp) CheckTx(req types.RequestCheckTx) types.ResponseCheckTx {
 
 	// 트랜잭션 파싱 및 기본 검증
 	if isValidTx(req.Tx) {
-		// 유효한 트랜잭션은 우선순위 계산 (예: gas price 기반)
+		// 트랜잭션 파싱
+		ethTx, err := parseEthereumTx(req.Tx)
+		if err != nil {
+			return types.ResponseCheckTx{
+				Code: 1,
+				Log:  fmt.Sprintf("invalid transaction format: %v", err),
+			}
+		}
+		
+		// 논스 검증
+		sender, err := ethTx.From()
+		if err != nil {
+			return types.ResponseCheckTx{
+				Code: 1,
+				Log:  fmt.Sprintf("failed to get sender: %v", err),
+			}
+		}
+		
+		expectedNonce := app.ethState.GetNonce(sender)
+		txNonce := ethTx.Nonce()
+		
+		// 논스 검증 (mempool에서는 현재 논스 또는 미래 논스도 허용)
+		if txNonce < expectedNonce {
+			return types.ResponseCheckTx{
+				Code: 1,
+				Log:  fmt.Sprintf("nonce too low: got %d, expected at least %d", txNonce, expectedNonce),
+			}
+		}
+		
+		// 잔액 검증
+		cost := new(big.Int).Mul(new(big.Int).SetUint64(ethTx.Gas()), ethTx.GasPrice())
+		cost.Add(cost, ethTx.Value())
+		if app.ethState.GetBalance(sender).Cmp(cost) < 0 {
+			return types.ResponseCheckTx{
+				Code: 1,
+				Log:  "insufficient funds for gas * price + value",
+			}
+		}
+
+		// 유효한 트랜잭션은 우선순위 계산 (gas price 기반)
 		priority := calculateTxPriority(req.Tx)
+		
+		// 우선순위 큐에 추가
+		app.mempoolTxs.Add(req.Tx, priority)
+		app.mempoolTxs.Sort()
 		
 		return types.ResponseCheckTx{
 			Code:      0,
@@ -482,39 +590,153 @@ func calculateTxHash(tx []byte) []byte {
 
 // 트랜잭션 유효성 검사
 func isValidTx(tx []byte) bool {
-	// 실제 구현에서는 이더리움 트랜잭션 형식 검증
-	return len(tx) >= 2
+	// 이더리움 트랜잭션 파싱
+	ethTx, err := parseEthereumTx(tx)
+	if err != nil {
+		return false
+	}
+	
+	// 기본 유효성 검사
+	if ethTx.Gas() < 21000 {  // 최소 가스 요구량
+		return false
+	}
+	
+	if ethTx.GasPrice().Sign() <= 0 {  // 가스 가격은 양수여야 함
+		return false
+	}
+	
+	// 서명 검증
+	_, err = ethTx.From()
+	if err != nil {
+		return false
+	}
+	
+	return true
 }
 
-// 트랜잭션 우선순위 계산
+// 트랜잭션 우선순위 계산 - 가스 가격 기반
 func calculateTxPriority(tx []byte) int64 {
-	// 실제 구현에서는 gas price 기반 우선순위 계산
-	return 1
+	ethTx, err := parseEthereumTx(tx)
+	if err != nil {
+		return 0
+	}
+	
+	// 가스 가격이 높을수록 우선순위가 높음
+	// 정수 오버플로우 방지를 위한 처리
+	gasPrice := ethTx.GasPrice()
+	if gasPrice.BitLen() > 63 {  // int64 범위 초과
+		return int64(^uint64(0) >> 1)  // 최대 int64 값
+	}
+	
+	return gasPrice.Int64()
 }
 
-// 예상 가스 사용량 계산
+// 가스 요구량 추정
 func estimateGasWanted(tx []byte) int64 {
-	// 실제 구현에서는 트랜잭션 유형에 따른 가스 계산
-	return 21000 // 기본 이더리움 트랜잭션 가스
+	ethTx, err := parseEthereumTx(tx)
+	if err != nil {
+		return 21000  // 기본 트랜잭션 가스 비용
+	}
+	
+	gas := ethTx.Gas()
+	if gas > uint64(1<<63 - 1) {  // int64 최대값보다 큰 경우
+		return int64(1<<63 - 1)  // 최대 int64 값
+	}
+	
+	return int64(gas)
 }
 
 // 트랜잭션 실행
 func executeTx(tx []byte, state *AppState) ([]byte, uint32, uint64, []types.Event, error) {
-	// 실제 구현에서는 EVM 실행 로직 구현
-	// 간단한 예시
-	data := []byte("executed")
-	status := uint32(1) // 성공
-	gasUsed := uint64(21000)
+	// 트랜잭션 파싱
+	ethTx, err := parseEthereumTx(tx)
+	if err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("failed to parse ethereum transaction: %v", err)
+	}
+	
+	// 이더리움 상태 어댑터 생성
+	ethState, err := getEthereumState(state)
+	if err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("failed to get ethereum state: %v", err)
+	}
+	
+	// 논스 검증
+	sender, err := ethTx.From()
+	if err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("failed to get sender: %v", err)
+	}
+	
+	expectedNonce := ethState.GetNonce(sender)
+	txNonce := ethTx.Nonce()
+	if txNonce != expectedNonce {
+		return nil, 0, 0, nil, fmt.Errorf("invalid nonce: got %d, expected %d", txNonce, expectedNonce)
+	}
+	
+	// 이더리움 트랜잭션 실행
+	data, gasUsed, err := ethereum.ExecuteTx(ethState, ethTx)
+	
+	// 결과 상태에 따른 이벤트 생성
 	events := []types.Event{
 		{
 			Type: "eirene_tx",
 			Attributes: []types.EventAttribute{
-				{Key: []byte("success"), Value: []byte("true"), Index: true},
+				{Key: []byte("tx_hash"), Value: []byte(fmt.Sprintf("%X", calculateTxHash(tx))), Index: true},
+				{Key: []byte("from"), Value: []byte(sender.Hex()), Index: true},
 			},
 		},
 	}
 	
-	return data, status, gasUsed, events, nil
+	// 컨트랙트 호출인 경우 to 주소 추가
+	if ethTx.To() != nil {
+		events[0].Attributes = append(events[0].Attributes,
+			types.EventAttribute{Key: []byte("to"), Value: []byte(ethTx.To().Hex()), Index: true})
+	}
+	
+	// 성공/실패 상태 추가
+	status := uint32(1) // 성공
+	if err != nil {
+		status = 0 // 실패
+		events[0].Attributes = append(events[0].Attributes,
+			types.EventAttribute{Key: []byte("error"), Value: []byte(err.Error()), Index: true})
+	} else {
+		events[0].Attributes = append(events[0].Attributes,
+			types.EventAttribute{Key: []byte("success"), Value: []byte("true"), Index: true})
+	}
+	
+	// 상태 업데이트 - 롤백 메커니즘이 필요한 경우 이 부분에서 처리
+	updateAppStateFromEthState(state, ethState)
+	
+	return data, status, gasUsed, events, err
+}
+
+// 이더리움 트랜잭션 파싱
+func parseEthereumTx(txBytes []byte) (*ethereum.Transaction, error) {
+	// RLP 디코딩 사용
+	var tx ethereum.Transaction
+	err := rlp.DecodeBytes(txBytes, &tx)
+	if err != nil {
+		return nil, err
+	}
+	return &tx, nil
+}
+
+// 앱 상태에서 이더리움 상태 가져오기
+func getEthereumState(state *AppState) (*ethereum.State, error) {
+	// 실제 구현에서는 AppState에서 ethereum.State를 복구하거나 생성
+	// 임시 구현: 새 상태 생성
+	ethState := ethereum.NewState()
+	
+	// TODO: AppState에서 ethereum.State로 상태 변환 로직 구현
+	// 이 부분은 실제 구현에서 AppState와 ethereum.State의 관계에 따라 결정
+	
+	return ethState, nil
+}
+
+// 이더리움 상태에서 앱 상태 업데이트
+func updateAppStateFromEthState(appState *AppState, ethState *ethereum.State) {
+	// 실제 구현에서는 ethereum.State에서 AppState로 상태 변환
+	// 임시 구현: StateRoot만 업데이트
+	appState.StateRoot = ethState.GetStateRoot()
 }
 
 // 블록 보상 분배
