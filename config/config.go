@@ -77,6 +77,9 @@ type Config struct {
 	Storage         *StorageConfig         `mapstructure:"storage"`
 	TxIndex         *TxIndexConfig         `mapstructure:"tx_index"`
 	Instrumentation *InstrumentationConfig `mapstructure:"instrumentation"`
+
+	// EVM은 EVM 관련 설정을 포함합니다.
+	EVM *EVMConfig `mapstructure:"evm"`
 }
 
 // DefaultConfig returns a default configuration for a Tendermint node
@@ -92,23 +95,20 @@ func DefaultConfig() *Config {
 		Storage:         DefaultStorageConfig(),
 		TxIndex:         DefaultTxIndexConfig(),
 		Instrumentation: DefaultInstrumentationConfig(),
+		EVM:             DefaultEVMConfig(),
 	}
 }
 
 // TestConfig returns a configuration that can be used for testing
 func TestConfig() *Config {
-	return &Config{
-		BaseConfig:      TestBaseConfig(),
-		RPC:             TestRPCConfig(),
-		P2P:             TestP2PConfig(),
-		Mempool:         TestMempoolConfig(),
-		StateSync:       TestStateSyncConfig(),
-		FastSync:        TestFastSyncConfig(),
-		Consensus:       TestConsensusConfig(),
-		Storage:         TestStorageConfig(),
-		TxIndex:         TestTxIndexConfig(),
-		Instrumentation: TestInstrumentationConfig(),
-	}
+	cfg := DefaultConfig()
+
+	// 테스트 환경에서 EVM 설정 조정
+	cfg.EVM.Enabled = true
+	cfg.EVM.ChainID = 1337   // 테스트 체인 ID
+	cfg.EVM.StateDBPath = "" // 인메모리 DB 사용
+
+	return cfg
 }
 
 // SetRoot sets the RootDir for all Config structs
@@ -148,6 +148,20 @@ func (cfg *Config) ValidateBasic() error {
 	if err := cfg.Instrumentation.ValidateBasic(); err != nil {
 		return fmt.Errorf("error in [instrumentation] section: %w", err)
 	}
+
+	// EVM 설정 검증
+	if cfg.EVM.Enabled {
+		if cfg.EVM.ChainID <= 0 {
+			return errors.New("evm.chain_id must be positive")
+		}
+		if cfg.EVM.GasLimit <= 0 {
+			return errors.New("evm.gas_limit must be positive")
+		}
+		if cfg.EVM.TargetBlockTime <= 0 {
+			return errors.New("evm.target_block_time must be positive")
+		}
+	}
+
 	return nil
 }
 
@@ -524,7 +538,7 @@ type P2PConfig struct { //nolint: maligned
 	ExternalAddress string `mapstructure:"external_address"`
 
 	// Comma separated list of seed nodes to connect to
-	// We only use these if we can’t connect to peers in the addrbook
+	// We only use these if we can't connect to peers in the addrbook
 	Seeds string `mapstructure:"seeds"`
 
 	// Comma separated list of nodes to keep persistent connections to
@@ -923,11 +937,11 @@ type ConsensusConfig struct {
 	TimeoutPropose time.Duration `mapstructure:"timeout_propose"`
 	// How much timeout_propose increases with each round
 	TimeoutProposeDelta time.Duration `mapstructure:"timeout_propose_delta"`
-	// How long we wait after receiving +2/3 prevotes for “anything” (ie. not a single block or nil)
+	// How long we wait after receiving +2/3 prevotes for "anything" (ie. not a single block or nil)
 	TimeoutPrevote time.Duration `mapstructure:"timeout_prevote"`
 	// How much the timeout_prevote increases with each round
 	TimeoutPrevoteDelta time.Duration `mapstructure:"timeout_prevote_delta"`
-	// How long we wait after receiving +2/3 precommits for “anything” (ie. not a single block or nil)
+	// How long we wait after receiving +2/3 precommits for "anything" (ie. not a single block or nil)
 	TimeoutPrecommit time.Duration `mapstructure:"timeout_precommit"`
 	// How much the timeout_precommit increases with each round
 	TimeoutPrecommitDelta time.Duration `mapstructure:"timeout_precommit_delta"`
@@ -1214,4 +1228,37 @@ func getDefaultMoniker() string {
 		moniker = "anonymous"
 	}
 	return moniker
+}
+
+// EVMConfig는 이더리움 호환 설정을 정의합니다.
+type EVMConfig struct {
+	// Enabled는 EVM 모드 활성화 여부입니다.
+	Enabled bool `mapstructure:"enabled"`
+
+	// ChainID는 이더리움 체인 ID입니다.
+	ChainID int64 `mapstructure:"chain_id"`
+
+	// GasLimit는 블록당 최대 가스 한도입니다.
+	GasLimit int64 `mapstructure:"gas_limit"`
+
+	// TargetBlockTime은 블록 생성 목표 시간(초)입니다.
+	TargetBlockTime int `mapstructure:"target_block_time"`
+
+	// StakingContract는 스테이킹 컨트랙트 주소입니다.
+	StakingContract string `mapstructure:"staking_contract"`
+
+	// StateDBPath는 상태 데이터베이스 경로입니다.
+	StateDBPath string `mapstructure:"statedb_path"`
+}
+
+// DefaultEVMConfig는 EVM 관련 기본 설정을 반환합니다.
+func DefaultEVMConfig() *EVMConfig {
+	return &EVMConfig{
+		Enabled:         false,
+		ChainID:         1,
+		GasLimit:        30000000,
+		TargetBlockTime: 2,
+		StakingContract: "",
+		StateDBPath:     "data/evmstate",
+	}
 }

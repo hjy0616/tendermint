@@ -512,37 +512,3 @@ func (cli *socketClient) stopForError(err error) {
 		cli.Logger.Error("Error stopping abci.socketClient", "err", err)
 	}
 }
-
-// DeliverEthereumTxAsync 메서드는 이더리움 트랜잭션 정보를 포함하여 DeliverTx 요청을 비동기적으로 보냅니다.
-func (cli *socketClient) DeliverEthereumTxAsync(tx []byte, ethInfo types.EthereumTxInfo) *ReqRes {
-	req := types.ToRequestDeliverTxWithEthInfo(tx, ethInfo)
-	return cli.queueRequest(req)
-}
-
-// CheckEthereumTxAsync 메서드는 이더리움 트랜잭션 정보를 포함하여 CheckTx 요청을 비동기적으로 보냅니다.
-func (cli *socketClient) CheckEthereumTxAsync(tx []byte, txType types.CheckTxType, ethInfo types.EthereumTxInfo) *ReqRes {
-	req := types.ToRequestCheckTxWithEthInfo(tx, txType, ethInfo)
-	return cli.queueRequest(req)
-}
-
-// DeliverEthereumTxSync 메서드는 이더리움 트랜잭션 정보를 포함하여 DeliverTx 요청을 동기적으로 보냅니다.
-func (cli *socketClient) DeliverEthereumTxSync(tx []byte, ethInfo types.EthereumTxInfo) (*types.ResponseDeliverTx, error) {
-	reqres := cli.DeliverEthereumTxAsync(tx, ethInfo)
-	cli.FlushSync()
-	if err := cli.Error(); err != nil {
-		return nil, err
-	}
-	resp := reqres.Response.GetDeliverTx()
-	return resp, nil
-}
-
-// CheckEthereumTxSync 메서드는 이더리움 트랜잭션 정보를 포함하여 CheckTx 요청을 동기적으로 보냅니다.
-func (cli *socketClient) CheckEthereumTxSync(tx []byte, txType types.CheckTxType, ethInfo types.EthereumTxInfo) (*types.ResponseCheckTx, error) {
-	reqres := cli.CheckEthereumTxAsync(tx, txType, ethInfo)
-	cli.FlushSync()
-	if err := cli.Error(); err != nil {
-		return nil, err
-	}
-	resp := reqres.Response.GetCheckTx()
-	return resp, nil
-}

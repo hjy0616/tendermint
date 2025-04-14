@@ -41,10 +41,6 @@ type Client interface {
 	LoadSnapshotChunkAsync(types.RequestLoadSnapshotChunk) *ReqRes
 	ApplySnapshotChunkAsync(types.RequestApplySnapshotChunk) *ReqRes
 
-	// 이더리움 트랜잭션 확장 메서드
-	DeliverEthereumTxAsync(tx []byte, ethInfo types.EthereumTxInfo) *ReqRes
-	CheckEthereumTxAsync(tx []byte, txType types.CheckTxType, ethInfo types.EthereumTxInfo) *ReqRes
-
 	FlushSync() error
 	EchoSync(msg string) (*types.ResponseEcho, error)
 	InfoSync(types.RequestInfo) (*types.ResponseInfo, error)
@@ -60,10 +56,6 @@ type Client interface {
 	OfferSnapshotSync(types.RequestOfferSnapshot) (*types.ResponseOfferSnapshot, error)
 	LoadSnapshotChunkSync(types.RequestLoadSnapshotChunk) (*types.ResponseLoadSnapshotChunk, error)
 	ApplySnapshotChunkSync(types.RequestApplySnapshotChunk) (*types.ResponseApplySnapshotChunk, error)
-
-	// 이더리움 트랜잭션 동기 메서드
-	DeliverEthereumTxSync(tx []byte, ethInfo types.EthereumTxInfo) (*types.ResponseDeliverTx, error)
-	CheckEthereumTxSync(tx []byte, txType types.CheckTxType, ethInfo types.EthereumTxInfo) (*types.ResponseCheckTx, error)
 }
 
 //----------------------------------------

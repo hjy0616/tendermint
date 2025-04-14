@@ -417,35 +417,3 @@ func (cli *grpcClient) ApplySnapshotChunkSync(
 	reqres := cli.ApplySnapshotChunkAsync(params)
 	return cli.finishSyncCall(reqres).GetApplySnapshotChunk(), cli.Error()
 }
-
-// DeliverEthereumTxAsync 메서드는 이더리움 트랜잭션 정보를 포함하여 DeliverTx 요청을 비동기적으로 보냅니다.
-func (cli *grpcClient) DeliverEthereumTxAsync(tx []byte, ethInfo types.EthereumTxInfo) *ReqRes {
-	req := types.ToRequestDeliverTxWithEthInfo(tx, ethInfo)
-	res, err := cli.client.DeliverTx(context.Background(), req.GetDeliverTx())
-	if err != nil {
-		cli.StopForError(err)
-	}
-	return cli.finishAsyncCall(req, &types.Response{Value: &types.Response_DeliverTx{DeliverTx: res}})
-}
-
-// CheckEthereumTxAsync 메서드는 이더리움 트랜잭션 정보를 포함하여 CheckTx 요청을 비동기적으로 보냅니다.
-func (cli *grpcClient) CheckEthereumTxAsync(tx []byte, txType types.CheckTxType, ethInfo types.EthereumTxInfo) *ReqRes {
-	req := types.ToRequestCheckTxWithEthInfo(tx, txType, ethInfo)
-	res, err := cli.client.CheckTx(context.Background(), req.GetCheckTx())
-	if err != nil {
-		cli.StopForError(err)
-	}
-	return cli.finishAsyncCall(req, &types.Response{Value: &types.Response_CheckTx{CheckTx: res}})
-}
-
-// DeliverEthereumTxSync 메서드는 이더리움 트랜잭션 정보를 포함하여 DeliverTx 요청을 동기적으로 보냅니다.
-func (cli *grpcClient) DeliverEthereumTxSync(tx []byte, ethInfo types.EthereumTxInfo) (*types.ResponseDeliverTx, error) {
-	reqres := cli.DeliverEthereumTxAsync(tx, ethInfo)
-	return cli.finishSyncCall(reqres).GetDeliverTx(), cli.Error()
-}
-
-// CheckEthereumTxSync 메서드는 이더리움 트랜잭션 정보를 포함하여 CheckTx 요청을 동기적으로 보냅니다.
-func (cli *grpcClient) CheckEthereumTxSync(tx []byte, txType types.CheckTxType, ethInfo types.EthereumTxInfo) (*types.ResponseCheckTx, error) {
-	reqres := cli.CheckEthereumTxAsync(tx, txType, ethInfo)
-	return cli.finishSyncCall(reqres).GetCheckTx(), cli.Error()
-}
