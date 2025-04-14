@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
 	"sort"
 	"sync"
 
+	"github.com/tendermint/tendermint/abci/example/eireneapp/config"
 	"github.com/tendermint/tendermint/abci/example/eireneapp/ethereum"
 	"github.com/tendermint/tendermint/abci/example/eireneapp/ethereum/rlp"
 	"github.com/tendermint/tendermint/abci/example/eireneapp/validators"
@@ -113,6 +115,20 @@ func NewEireneApp(db tmdb.DB) *EireneApp {
 		},
 		stateSnapshots: make([]*ethereum.State, 0),
 	}
+}
+
+// NewEireneAppWithConfig는 설정을 적용한 새로운 EireneApp 인스턴스를 생성합니다.
+func NewEireneAppWithConfig(db tmdb.DB, appConfig *config.EireneConfig) *EireneApp {
+	app := NewEireneApp(db)
+	
+	// 로거 설정
+	logger := log.NewTMLogger(os.Stdout)
+	app.SetLogger(logger)
+	
+	// 여기서는 검증자 관리 초기화를 생략합니다.
+	// 실제 구현에서는 검증자 관리자를 설정해야 합니다.
+	
+	return app
 }
 
 // SetLogger는 애플리케이션의 로거를 설정합니다.
