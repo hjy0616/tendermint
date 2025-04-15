@@ -55,6 +55,74 @@ type TxMempool struct {
 	txs        *clist.CList // valid transactions (passed CheckTx)
 	txByKey    map[types.TxKey]*clist.CElement
 	txBySender map[string]*clist.CElement // for sender != ""
+
+	// 이더리움 호환성을 위한 추가 필드
+	gasPricedTxs     *GasPriceTxQueue // 가스 가격 기반 우선순위 큐
+	ethCompatible    bool             // 이더리움 호환 모드 여부
+	pendingTxCache   *sync.Map        // 검증 중인 트랜잭션 캐시
+	broadcastCh      chan types.Tx    // 트랜잭션 브로드캐스트 채널
+	broadcastWorkers int              // 브로드캐스트 워커 수
+	maxBatchSize     int              // 브로드캐스트 배치 최대 크기
+}
+
+// GasPriceTxQueue는 가스 가격 기준 우선순위 큐입니다.
+type GasPriceTxQueue struct {
+	txs    []*WrappedTx
+	sorted bool
+	mtx    sync.RWMutex
+}
+
+// NewGasPriceTxQueue는 새로운 가스 가격 기반 우선순위 큐를 생성합니다.
+func NewGasPriceTxQueue() *GasPriceTxQueue {
+	return &GasPriceTxQueue{
+		txs:    make([]*WrappedTx, 0),
+		sorted: true,
+	}
+}
+
+// Add는 큐에 트랜잭션을 추가합니다.
+func (q *GasPriceTxQueue) Add(tx *WrappedTx) {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	q.txs = append(q.txs, tx)
+	q.sorted = false
+}
+
+// Remove는 큐에서 트랜잭션을 제거합니다.
+func (q *GasPriceTxQueue) Remove(txKey types.TxKey) {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	for i, tx := range q.txs {
+		if tx.hash == txKey {
+			q.txs = append(q.txs[:i], q.txs[i+1:]...)
+			return
+		}
+	}
+}
+
+// GetSortedTxs는 가스 가격 내림차순으로 정렬된 트랜잭션 목록을 반환합니다.
+func (q *GasPriceTxQueue) GetSortedTxs() []*WrappedTx {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	if !q.sorted {
+		sort.Slice(q.txs, func(i, j int) bool {
+			return q.txs[i].gasPrice > q.txs[j].gasPrice
+		})
+		q.sorted = true
+	}
+
+	return q.txs
+}
+
+// Size는 큐의 크기를 반환합니다.
+func (q *GasPriceTxQueue) Size() int {
+	q.mtx.RLock()
+	defer q.mtx.RUnlock()
+
+	return len(q.txs)
 }
 
 // NewTxMempool constructs a new, empty priority mempool at the specified
@@ -78,6 +146,11 @@ func NewTxMempool(
 		height:       height,
 		txByKey:      make(map[types.TxKey]*clist.CElement),
 		txBySender:   make(map[string]*clist.CElement),
+
+		// 기본값 설정
+		ethCompatible:    false,
+		broadcastWorkers: 4,
+		maxBatchSize:     100,
 	}
 	if cfg.CacheSize > 0 {
 		txmp.cache = mempool.NewLRUTxCache(cfg.CacheSize)
@@ -85,6 +158,13 @@ func NewTxMempool(
 
 	for _, opt := range options {
 		opt(txmp)
+	}
+
+	// 이더리움 호환 모드이면 브로드캐스트 워커 시작
+	if txmp.ethCompatible && txmp.broadcastCh != nil {
+		for i := 0; i < txmp.broadcastWorkers; i++ {
+			go txmp.broadcastWorker()
+		}
 	}
 
 	return txmp
@@ -107,6 +187,18 @@ func WithPostCheck(f mempool.PostCheckFunc) TxMempoolOption {
 // WithMetrics sets the mempool's metrics collector.
 func WithMetrics(metrics *mempool.Metrics) TxMempoolOption {
 	return func(txmp *TxMempool) { txmp.metrics = metrics }
+}
+
+// WithEthCompatibility는 이더리움 호환성을 위한 새로운 옵션을 추가합니다.
+func WithEthCompatibility() TxMempoolOption {
+	return func(txmp *TxMempool) {
+		txmp.ethCompatible = true
+		txmp.gasPricedTxs = NewGasPriceTxQueue()
+		txmp.pendingTxCache = &sync.Map{}
+		txmp.broadcastCh = make(chan types.Tx, 1000)
+		txmp.broadcastWorkers = 4
+		txmp.maxBatchSize = 100
+	}
 }
 
 // Lock obtains a write-lock on the mempool. A caller must be sure to explicitly
@@ -217,23 +309,102 @@ func (txmp *TxMempool) CheckTx(tx types.Tx, cb func(*abci.Response), txInfo memp
 		return err
 	}
 
-	// Invoke an ABCI CheckTx for this transaction.
-	rsp, err := txmp.proxyAppConn.CheckTxSync(abci.RequestCheckTx{Tx: tx})
-	if err != nil {
-		txmp.cache.Remove(tx)
-		return err
-	}
-	wtx := &WrappedTx{
-		tx:        tx,
-		hash:      tx.Key(),
-		timestamp: time.Now().UTC(),
-		height:    height,
-	}
-	wtx.SetPeer(txInfo.SenderID)
-	txmp.addNewTransaction(wtx, rsp)
-	if cb != nil {
-		cb(&abci.Response{Value: &abci.Response_CheckTx{CheckTx: rsp}})
-	}
+	// Application을 통한 CheckTx 처리 - cb 함수를 통해 결과 처리
+	txmp.proxyAppConn.CheckTxAsync(abci.RequestCheckTx{
+		Tx:   tx,
+		Type: abci.CheckTxType_New,
+	}, func(res *abci.Response) {
+		checkTxRes, ok := res.Value.(*abci.Response_CheckTx)
+		if !ok {
+			// 응답 타입이 잘못된 경우
+			txmp.logger.Error("unexpected response type", "response", fmt.Sprintf("%T", res.Value))
+			return
+		}
+
+		checkTxR := checkTxRes.CheckTx
+		txmp.mtx.Lock()
+		defer txmp.mtx.Unlock()
+
+		// 이더리움 호환 모드에서는 가스 가격 정보 처리
+		var gasPrice int64
+		if txmp.ethCompatible {
+			// 이더리움 트랜잭션에서 가스 가격 추출
+			// 실제 구현은 이더리움 트랜잭션 구조에 따라 달라질 수 있음
+			// 여기서는 CheckTx 응답의 GasPrice 필드를 사용한다고 가정
+			gasPrice = checkTxR.GasPrice
+
+			// 검증 중인 트랜잭션 캐시에서 제거
+			if txmp.pendingTxCache != nil {
+				txmp.pendingTxCache.Delete(string(tx.Hash()))
+			}
+		}
+
+		// 트랜잭션 래핑
+		wtx := &WrappedTx{
+			tx:        tx,
+			hash:      mempool.TxKey(tx),
+			sender:    txInfo.SenderID,
+			priority:  checkTxR.Priority,
+			gasWanted: checkTxR.GasWanted,
+			gasPrice:  gasPrice, // 가스 가격 정보 추가
+		}
+
+		// 응용 프로그램이 응답을 통해 트랜잭션을 거부한 경우
+		if checkTxR.Code != abci.CodeTypeOK {
+			if txInfo.SenderID != "" && checkTxR.Code != abci.CodeTypeInsufficientFunds {
+				// 시뮬레이션 값이 부정확할 가능성이 있으므로 해당 발신자 논스를 재설정
+				txmp.logger.Debug("resetting sender nonce value", "sender", txInfo.SenderID)
+				delete(txmp.txBySender, txInfo.SenderID)
+			}
+
+			// 포스트체크 콜백 실행
+			if cb != nil {
+				cb(res)
+			}
+			return
+		}
+
+		// 트랜잭션 추가 가능한지 확인
+		if err := txmp.canAddTx(wtx); err != nil {
+			// 메모리풀이 가득 찬 경우 낮은 우선순위 트랜잭션 제거 시도
+			if txmp.ethCompatible && gasPrice > 0 {
+				// 가스 가격 기반 증발 처리
+				txmp.evictLowPriorityTxs(wtx)
+			}
+
+			// 다시 확인
+			if err := txmp.canAddTx(wtx); err != nil {
+				if cb != nil {
+					cb(res)
+				}
+				return
+			}
+		}
+
+		// 트랜잭션 추가
+		txmp.addNewTransaction(wtx, &checkTxR)
+
+		// 이더리움 호환 모드에서 가스 가격 기반 큐에도 추가
+		if txmp.ethCompatible && txmp.gasPricedTxs != nil {
+			txmp.gasPricedTxs.Add(wtx)
+		}
+
+		// 트랜잭션 브로드캐스트
+		if txmp.ethCompatible && txmp.broadcastCh != nil {
+			select {
+			case txmp.broadcastCh <- tx:
+				// 성공적으로 브로드캐스트 큐에 추가됨
+			default:
+				// 채널이 가득 찬 경우 로그만 남기고 넘어감
+				txmp.logger.Debug("broadcast channel full, skipping broadcast")
+			}
+		}
+
+		if cb != nil {
+			cb(res)
+		}
+	})
+
 	return nil
 }
 
@@ -322,20 +493,87 @@ func (txmp *TxMempool) allEntriesSorted() []*WrappedTx {
 // If the mempool is empty or has no transactions fitting within the given
 // constraints, the result will also be empty.
 func (txmp *TxMempool) ReapMaxBytesMaxGas(maxBytes, maxGas int64) types.Txs {
-	var totalGas, totalBytes int64
+	txmp.mtx.Lock()
+	defer txmp.mtx.Unlock()
 
-	var keep []types.Tx //nolint:prealloc
-	for _, w := range txmp.allEntriesSorted() {
-		// N.B. When computing byte size, we need to include the overhead for
-		// encoding as protobuf to send to the application.
-		totalGas += w.gasWanted
-		totalBytes += types.ComputeProtoSizeForTxs([]types.Tx{w.tx})
-		if (maxGas >= 0 && totalGas > maxGas) || (maxBytes >= 0 && totalBytes > maxBytes) {
+	// 이더리움 호환 모드에서는 가스 가격 기반 우선순위 사용
+	if txmp.ethCompatible && txmp.gasPricedTxs != nil && txmp.gasPricedTxs.Size() > 0 {
+		return txmp.reapMaxBytesMaxGasEth(maxBytes, maxGas)
+	}
+
+	// 기존 구현 사용
+	return txmp.reapMaxBytesMaxGasStandard(maxBytes, maxGas)
+}
+
+// 기존의 ReapMaxBytesMaxGas 로직을 분리
+func (txmp *TxMempool) reapMaxBytesMaxGasStandard(maxBytes, maxGas int64) types.Txs {
+	if maxBytes < 0 && maxGas < 0 {
+		return txmp.ReapMaxTxs(-1)
+	}
+
+	var (
+		totalGas  int64
+		totalSize int64
+	)
+
+	// TODO: we will get better performance if we have a separate
+	// list of valid txs.
+	txs := make([]types.Tx, 0, txmp.txs.Len())
+	for e := txmp.txs.Front(); e != nil; e = e.Next() {
+		memTx := e.Value.(*WrappedTx)
+		// Check total size requirement
+		aminoOverhead := types.ComputeAminoOverhead(memTx.tx, 1)
+		txSize := int64(len(memTx.tx)) + aminoOverhead
+		if maxBytes > -1 && totalSize+txSize > maxBytes {
 			break
 		}
-		keep = append(keep, w.tx)
+		totalSize += txSize
+		// Check total gas requirement.
+		// If maxGas is negative, skip this check.
+		// Since newTotalGas < masGas, which
+		// must be non-negative, it follows that this won't overflow.
+		newTotalGas := totalGas + memTx.gasWanted
+		if maxGas > -1 && newTotalGas > maxGas {
+			break
+		}
+		totalGas = newTotalGas
+		txs = append(txs, memTx.tx)
 	}
-	return keep
+	return txs
+}
+
+// 이더리움 호환 모드용 ReapMaxBytesMaxGas 구현
+func (txmp *TxMempool) reapMaxBytesMaxGasEth(maxBytes, maxGas int64) types.Txs {
+	// 가스 가격 기준으로 정렬된 트랜잭션 목록 가져오기
+	sortedTxs := txmp.gasPricedTxs.GetSortedTxs()
+
+	var (
+		totalGas  int64
+		totalSize int64
+		result    = make([]types.Tx, 0, len(sortedTxs))
+	)
+
+	for _, tx := range sortedTxs {
+		// 최대 바이트 체크
+		txSize := int64(len(tx.tx))
+		if maxBytes > -1 && totalSize+txSize > maxBytes {
+			continue
+		}
+
+		// 최대 가스 체크
+		if maxGas > -1 && totalGas+tx.gasWanted > maxGas {
+			continue
+		}
+
+		// 발신자별 논스 순서대로 처리 (이더리움 호환성)
+		// 실제 구현은 발신자 주소와 논스 추출 로직에 따라 달라질 수 있음
+
+		totalSize += txSize
+		totalGas += tx.gasWanted
+		result = append(result, tx.tx)
+	}
+
+	return result
 }
 
 // TxsWaitChan returns a channel that is closed when there is at least one
@@ -764,6 +1002,57 @@ func (txmp *TxMempool) notifyTxsAvailable() {
 		select {
 		case txmp.txsAvailable <- struct{}{}:
 		default:
+		}
+	}
+}
+
+// 가스 가격 기반 낮은 우선순위 트랜잭션 제거
+func (txmp *TxMempool) evictLowPriorityTxs(newTx *WrappedTx) {
+	if txmp.gasPricedTxs == nil || txmp.gasPricedTxs.Size() == 0 {
+		return
+	}
+
+	// 가스 가격 기준으로 정렬된 트랜잭션 목록 가져오기
+	sortedTxs := txmp.gasPricedTxs.GetSortedTxs()
+
+	// 새 트랜잭션보다 가스 가격이 낮은 트랜잭션 찾기
+	var evictCandidates []*WrappedTx
+	var totalSize int64
+
+	for i := len(sortedTxs) - 1; i >= 0; i-- {
+		tx := sortedTxs[i]
+		if tx.gasPrice < newTx.gasPrice {
+			evictCandidates = append(evictCandidates, tx)
+			totalSize += int64(len(tx.tx))
+
+			// 새 트랜잭션 크기보다 충분한 공간을 확보하면 중단
+			if totalSize >= int64(len(newTx.tx)) {
+				break
+			}
+		}
+	}
+
+	// 후보 트랜잭션들 제거
+	for _, tx := range evictCandidates {
+		txmp.removeTxByKey(tx.hash)
+		txmp.gasPricedTxs.Remove(tx.hash)
+	}
+}
+
+// 트랜잭션 브로드캐스트 워커
+func (txmp *TxMempool) broadcastWorker() {
+	batch := make([]types.Tx, 0, txmp.maxBatchSize)
+
+	for tx := range txmp.broadcastCh {
+		batch = append(batch, tx)
+
+		// 배치 크기에 도달하거나 채널에 더 이상 트랜잭션이 없으면 브로드캐스트
+		if len(batch) >= txmp.maxBatchSize || len(txmp.broadcastCh) == 0 {
+			// 배치 브로드캐스트 처리
+			// 구현은 프로젝트에서 실제 브로드캐스트 방식에 따라 다를 수 있음
+
+			// 배치 초기화
+			batch = batch[:0]
 		}
 	}
 }

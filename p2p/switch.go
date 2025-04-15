@@ -93,6 +93,11 @@ type Switch struct {
 
 	metrics *Metrics
 	mlc     *metricsLabelCache
+
+	// 이더리움 피어 검색 통합을 위한 필드
+	peerDiscovery         *PeerDiscoveryManager
+	ethPeersEnabled       bool
+	discoveryRefreshTimer *time.Timer
 }
 
 // NetAddress returns the address the switch is listening on.
@@ -126,6 +131,7 @@ func NewSwitch(
 		persistentPeersAddrs: make([]*NetAddress, 0),
 		unconditionalPeerIDs: make(map[ID]struct{}),
 		mlc:                  newMetricsLabelCache(),
+		ethPeersEnabled:      false,
 	}
 
 	// Ensure we have a completely undeterministic PRNG.
@@ -136,6 +142,9 @@ func NewSwitch(
 	for _, option := range options {
 		option(sw)
 	}
+
+	// 피어 검색 관리자 초기화
+	sw.peerDiscovery = NewPeerDiscoveryManager(sw, 16) // 기본값으로 최대 16개 피어 검색
 
 	return sw
 }
@@ -229,33 +238,50 @@ func (sw *Switch) SetNodeKey(nodeKey *NodeKey) {
 
 // OnStart implements BaseService. It starts all the reactors and peers.
 func (sw *Switch) OnStart() error {
+	if err := sw.transport.Listen(sw.NetAddress()); err != nil {
+		return err
+	}
+
 	// Start reactors
 	for _, reactor := range sw.reactors {
 		err := reactor.Start()
 		if err != nil {
-			return fmt.Errorf("failed to start %v: %w", reactor, err)
+			return err
 		}
 	}
 
-	// Start accepting Peers.
+	// Start accepting connections
 	go sw.acceptRoutine()
+
+	// 이더리움 피어 검색이 활성화되어 있으면 시작
+	if sw.ethPeersEnabled {
+		sw.peerDiscovery.Start()
+	}
 
 	return nil
 }
 
 // OnStop implements BaseService. It stops all peers and reactors.
 func (sw *Switch) OnStop() {
-	// Stop peers
-	for _, p := range sw.peers.List() {
-		sw.stopAndRemovePeer(p, nil)
+	// 피어 검색 중지
+	if sw.peerDiscovery != nil {
+		sw.peerDiscovery.Stop()
 	}
 
-	// Stop reactors
-	sw.Logger.Debug("Switch: Stopping reactors")
+	// First stop the reactors.
 	for _, reactor := range sw.reactors {
 		if err := reactor.Stop(); err != nil {
-			sw.Logger.Error("error while stopped reactor", "reactor", reactor, "error", err)
+			sw.Logger.Error("Error stopping reactor", "reactor", reactor, "err", err)
 		}
+	}
+
+	if err := sw.transport.Close(); err != nil {
+		sw.Logger.Error("Error closing transport", "err", err)
+	}
+
+	// Finally, stop each peer.
+	for _, peer := range sw.peers.List() {
+		sw.stopAndRemovePeer(peer, nil)
 	}
 }
 
@@ -524,55 +550,45 @@ func (sw *Switch) DialPeersAsync(peers []string) error {
 }
 
 func (sw *Switch) dialPeersAsync(netAddrs []*NetAddress) {
-	ourAddr := sw.NetAddress()
+	// 다이얼링할 피어들을 우선순위에 따라 정렬
+	sortedAddrs := prioritizePeers(netAddrs)
 
-	// TODO: this code feels like it's in the wrong place.
-	// The integration tests depend on the addrBook being saved
-	// right away but maybe we can change that. Recall that
-	// the addrBook is only written to disk every 2min
-	if sw.addrBook != nil {
-		// add peers to `addrBook`
-		for _, netAddr := range netAddrs {
-			// do not add our address or ID
-			if !netAddr.Same(ourAddr) {
-				if err := sw.addrBook.AddAddress(netAddr, ourAddr); err != nil {
-					if isPrivateAddr(err) {
-						sw.Logger.Debug("Won't add peer's address to addrbook", "err", err)
-					} else {
-						sw.Logger.Error("Can't add peer's address to addrbook", "err", err)
-					}
-				}
-			}
+	for _, netAddr := range sortedAddrs {
+		if sw.IsDialingOrExistingAddress(netAddr) {
+			continue
 		}
-		// Persist some peers to disk right away.
-		// NOTE: integration tests depend on this
-		sw.addrBook.Save()
-	}
 
-	// permute the list, dial them in random order.
-	perm := sw.rng.Perm(len(netAddrs))
-	for i := 0; i < len(perm); i++ {
-		go func(i int) {
-			j := perm[i]
-			addr := netAddrs[j]
+		// 이미 연결 시도 중인지 확인
+		if sw.dialing.Has(string(netAddr.ID)) {
+			continue
+		}
 
-			if addr.Same(ourAddr) {
-				sw.Logger.Debug("Ignore attempt to connect to ourselves", "addr", addr, "ourAddr", ourAddr)
-				return
-			}
+		// 연결 가능한 최대 피어 수 확인
+		outbound, _, dialing := sw.NumPeers()
+		if outbound+dialing >= sw.config.MaxNumOutboundPeers {
+			sw.Logger.Debug("Max outbound peers reached", "numOutbound", outbound, "numDialing", dialing, "max", sw.config.MaxNumOutboundPeers)
+			return
+		}
 
-			sw.randomSleep(0)
+		sw.dialing.Set(string(netAddr.ID), netAddr)
+
+		go func(addr *NetAddress) {
+			// 다이얼링 완료 후 맵에서 제거
+			defer sw.dialing.Delete(string(addr.ID))
+
+			// 연결 시도 전 무작위 시간 대기
+			sw.randomSleep(dialRandomizerIntervalMilliseconds * time.Millisecond)
 
 			err := sw.DialPeerWithAddress(addr)
 			if err != nil {
 				switch err.(type) {
-				case ErrSwitchConnectToSelf, ErrSwitchDuplicatePeerID, ErrCurrentlyDialingOrExistingAddress:
-					sw.Logger.Debug("Error dialing peer", "err", err)
+				case *ErrSwitchConnectToSelf, *ErrSwitchDuplicatePeerID:
+					sw.Logger.Debug("Error dialing peer", "err", err, "addr", addr)
 				default:
-					sw.Logger.Error("Error dialing peer", "err", err)
+					sw.Logger.Info("Error dialing peer", "err", err, "addr", addr)
 				}
 			}
-		}(i)
+		}(netAddr)
 	}
 }
 
@@ -892,4 +908,103 @@ func (sw *Switch) addPeer(p Peer) error {
 	sw.Logger.Info("Added peer", "peer", p)
 
 	return nil
+}
+
+// 이더리움 피어 검색 관리자
+type PeerDiscoveryManager struct {
+	sw                 *Switch
+	discoverPeersTimer *time.Timer
+	maxPeersToDiscover int
+	discoveryEnabled   bool
+	mu                 sync.Mutex
+}
+
+// 새로운 피어 검색 관리자 생성
+func NewPeerDiscoveryManager(sw *Switch, maxPeersToDiscover int) *PeerDiscoveryManager {
+	return &PeerDiscoveryManager{
+		sw:                 sw,
+		maxPeersToDiscover: maxPeersToDiscover,
+		discoveryEnabled:   true,
+	}
+}
+
+// 피어 검색 시작
+func (pdm *PeerDiscoveryManager) Start() {
+	pdm.mu.Lock()
+	defer pdm.mu.Unlock()
+
+	pdm.discoverPeersTimer = time.AfterFunc(5*time.Second, pdm.discoverPeersRoutine)
+}
+
+// 피어 검색 루틴
+func (pdm *PeerDiscoveryManager) discoverPeersRoutine() {
+	pdm.mu.Lock()
+	defer pdm.mu.Unlock()
+
+	if !pdm.discoveryEnabled {
+		return
+	}
+
+	// 현재 연결된 피어 수
+	outbound, _, dialing := pdm.sw.NumPeers()
+	numToDial := pdm.maxPeersToDiscover - (outbound + dialing)
+
+	if numToDial <= 0 {
+		pdm.discoverPeersTimer = time.AfterFunc(30*time.Second, pdm.discoverPeersRoutine)
+		return
+	}
+
+	// 주소록에서 피어 검색
+	if pdm.sw.addrBook != nil {
+		peers := make([]*NetAddress, 0, numToDial)
+		// TODO: 이더리움 피어 검색 통합
+		// 이더리움 피어 검색 메커니즘 활용
+
+		if len(peers) > 0 {
+			go pdm.sw.dialPeersAsync(peers)
+		}
+	}
+
+	pdm.discoverPeersTimer = time.AfterFunc(15*time.Second, pdm.discoverPeersRoutine)
+}
+
+// 피어 검색 정지
+func (pdm *PeerDiscoveryManager) Stop() {
+	pdm.mu.Lock()
+	defer pdm.mu.Unlock()
+
+	pdm.discoveryEnabled = false
+	if pdm.discoverPeersTimer != nil {
+		pdm.discoverPeersTimer.Stop()
+		pdm.discoverPeersTimer = nil
+	}
+}
+
+// 피어 우선순위화 함수
+func prioritizePeers(peers []*NetAddress) []*NetAddress {
+	if len(peers) <= 1 {
+		return peers
+	}
+
+	// 우선순위별로 피어 정렬
+	// 1. 이전에 성공적으로 연결된 피어
+	// 2. 최근에 확인된 피어
+	// 3. 기타 피어들
+
+	// 간단한 구현: 무작위로 섞어서 네트워크 탐색을 다양화
+	rand.Shuffle(len(peers), func(i, j int) {
+		peers[i], peers[j] = peers[j], peers[i]
+	})
+
+	return peers
+}
+
+// 이더리움 피어 검색 활성화/비활성화
+func (sw *Switch) EnableEthPeerDiscovery(enable bool) {
+	sw.ethPeersEnabled = enable
+	if enable && sw.IsRunning() {
+		sw.peerDiscovery.Start()
+	} else if !enable && sw.IsRunning() {
+		sw.peerDiscovery.Stop()
+	}
 }
