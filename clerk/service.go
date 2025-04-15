@@ -2,14 +2,15 @@ package clerk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/tendermint/tendermint/clerk/types"
-	dbm "github.com/tendermint/tendermint/libs/db"
 	"github.com/tendermint/tendermint/libs/log"
+	dbm "github.com/tendermint/tm-db"
 )
 
 const (
@@ -207,13 +208,16 @@ func (c *clerkServiceImpl) GetEventRecord(ctx context.Context, id uint64) (*type
 	defer c.mu.RUnlock()
 
 	key := []byte(eventRecordPrefix + string(id))
-	data := c.db.Get(key)
+	data, err := c.db.Get(key)
+	if err != nil {
+		return nil, err
+	}
 	if data == nil {
 		return nil, ErrEventNotFound
 	}
 
 	var record types.EventRecord
-	err := c.db.GetCodec().UnmarshalBinaryBare(data, &record)
+	err = json.Unmarshal(data, &record)
 	if err != nil {
 		return nil, err
 	}
@@ -235,13 +239,17 @@ func (c *clerkServiceImpl) GetEventRecords(ctx context.Context, fromID, toID uin
 	// 지정된 범위의 이벤트 레코드 조회
 	for id := fromID; id <= toID; id++ {
 		key := []byte(eventRecordPrefix + string(id))
-		data := c.db.Get(key)
+		data, err := c.db.Get(key)
+		if err != nil {
+			c.logger.Error("Failed to get event record", "id", id, "error", err)
+			continue
+		}
 		if data == nil {
 			continue
 		}
 
 		var record types.EventRecord
-		err := c.db.GetCodec().UnmarshalBinaryBare(data, &record)
+		err = json.Unmarshal(data, &record)
 		if err != nil {
 			c.logger.Error("Failed to unmarshal event record", "id", id, "error", err)
 			continue
@@ -316,7 +324,7 @@ func (c *clerkServiceImpl) SyncEvents(ctx context.Context) error {
 			}
 
 			key := []byte(eventRecordPrefix + string(eventWithTime.ID))
-			data, err := c.db.GetCodec().MarshalBinaryBare(eventWithTime.EventRecord)
+			data, err := json.Marshal(eventWithTime.EventRecord)
 			if err != nil {
 				c.logger.Error("Failed to marshal event record", "id", eventWithTime.ID, "error", err)
 				continue
@@ -366,7 +374,11 @@ func (c *clerkServiceImpl) GetSyncStatus(ctx context.Context) (*types.EventSyncS
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	data := c.db.Get([]byte(syncStatusKey))
+	data, err := c.db.Get([]byte(syncStatusKey))
+	if err != nil {
+		return nil, err
+	}
+
 	if data == nil {
 		return &types.EventSyncStatus{
 			LastSyncedID: 0,
@@ -376,7 +388,7 @@ func (c *clerkServiceImpl) GetSyncStatus(ctx context.Context) (*types.EventSyncS
 	}
 
 	var status types.EventSyncStatus
-	err := c.db.GetCodec().UnmarshalBinaryBare(data, &status)
+	err = json.Unmarshal(data, &status)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +401,7 @@ func (c *clerkServiceImpl) GetSyncStatus(ctx context.Context) (*types.EventSyncS
 
 // updateSyncStatus는 동기화 상태를 업데이트합니다.
 func (c *clerkServiceImpl) updateSyncStatus(status *types.EventSyncStatus) error {
-	data, err := c.db.GetCodec().MarshalBinaryBare(status)
+	data, err := json.Marshal(status)
 	if err != nil {
 		return err
 	}
@@ -512,7 +524,7 @@ func (c *clerkServiceImpl) processEventBatch(events []types.EventRecordWithTime)
 
 	for _, event := range events {
 		key := []byte(eventRecordPrefix + string(event.ID))
-		data, err := c.db.GetCodec().MarshalBinaryBare(event.EventRecord)
+		data, err := json.Marshal(event.EventRecord)
 		if err != nil {
 			c.logger.Error("Failed to marshal event", "id", event.ID, "error", err)
 			continue
