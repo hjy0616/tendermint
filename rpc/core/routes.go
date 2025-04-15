@@ -52,6 +52,14 @@ var Routes = map[string]*rpc.RPCFunc{
 	"state_sync_event":        rpc.NewRPCFunc(StateSyncEvent, "id"),
 	"commit_state_sync_event": rpc.NewRPCFunc(CommitStateSyncEvent, "params"),
 	"clerk_sync_status":       rpc.NewRPCFunc(GetSyncStatus, ""),
+
+	// Milestone 시스템 관련 엔드포인트
+	"fetch_milestone":         rpc.NewRPCFunc(FetchMilestone, "id"),
+	"fetch_milestones":        rpc.NewRPCFunc(FetchMilestones, "from_id,to_id"),
+	"fetch_milestone_count":   rpc.NewRPCFunc(FetchMilestoneCount, ""),
+	"fetch_no_ack_milestones": rpc.NewRPCFunc(FetchNoAckMilestones, ""),
+	"ack_milestone":           rpc.NewRPCFunc(AckMilestone, "id"),
+	"add_milestone":           rpc.NewRPCFunc(AddMilestone, "params"),
 }
 
 // AddUnsafeRoutes adds unsafe routes.

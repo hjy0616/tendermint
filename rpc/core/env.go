@@ -14,6 +14,7 @@ import (
 	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
 	mempl "github.com/tendermint/tendermint/mempool"
+	"github.com/tendermint/tendermint/milestone"
 	"github.com/tendermint/tendermint/p2p"
 	"github.com/tendermint/tendermint/proxy"
 	sm "github.com/tendermint/tendermint/state"
@@ -97,7 +98,8 @@ type Environment struct {
 	HistoricalInfo *sm.HistoricalInfo
 
 	// new services
-	ClerkService clerk.ClerkService
+	ClerkService     clerk.ClerkService
+	MilestoneService milestone.MilestoneService
 
 	// metrics
 	Metrics *Metrics
