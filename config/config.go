@@ -524,7 +524,7 @@ type P2PConfig struct { //nolint: maligned
 	ExternalAddress string `mapstructure:"external_address"`
 
 	// Comma separated list of seed nodes to connect to
-	// We only use these if we can't connect to peers in the addrbook
+	// We only use these if we can’t connect to peers in the addrbook
 	Seeds string `mapstructure:"seeds"`
 
 	// Comma separated list of nodes to keep persistent connections to
@@ -919,18 +919,15 @@ type ConsensusConfig struct {
 	WalPath string `mapstructure:"wal_file"`
 	walFile string // overrides WalPath if set
 
-	// Use voting power based weighted proposer selection instead of the default priority based method
-	UseWeightedProposerSelection bool `mapstructure:"use_weighted_proposer_selection"`
-
 	// How long we wait for a proposal block before prevoting nil
 	TimeoutPropose time.Duration `mapstructure:"timeout_propose"`
 	// How much timeout_propose increases with each round
 	TimeoutProposeDelta time.Duration `mapstructure:"timeout_propose_delta"`
-	// How long we wait after receiving +2/3 prevotes for "anything" (ie. not a single block or nil)
+	// How long we wait after receiving +2/3 prevotes for “anything” (ie. not a single block or nil)
 	TimeoutPrevote time.Duration `mapstructure:"timeout_prevote"`
 	// How much the timeout_prevote increases with each round
 	TimeoutPrevoteDelta time.Duration `mapstructure:"timeout_prevote_delta"`
-	// How long we wait after receiving +2/3 precommits for "anything" (ie. not a single block or nil)
+	// How long we wait after receiving +2/3 precommits for “anything” (ie. not a single block or nil)
 	TimeoutPrecommit time.Duration `mapstructure:"timeout_precommit"`
 	// How much the timeout_precommit increases with each round
 	TimeoutPrecommitDelta time.Duration `mapstructure:"timeout_precommit_delta"`
@@ -957,21 +954,20 @@ type ConsensusConfig struct {
 // DefaultConsensusConfig returns a default configuration for the consensus service
 func DefaultConsensusConfig() *ConsensusConfig {
 	return &ConsensusConfig{
-		WalPath:                      filepath.Join(defaultDataDir, "cs.wal", "wal"),
-		TimeoutPropose:               3000 * time.Millisecond,
-		TimeoutProposeDelta:          500 * time.Millisecond,
-		TimeoutPrevote:               1000 * time.Millisecond,
-		TimeoutPrevoteDelta:          500 * time.Millisecond,
-		TimeoutPrecommit:             1000 * time.Millisecond,
-		TimeoutPrecommitDelta:        500 * time.Millisecond,
-		TimeoutCommit:                1000 * time.Millisecond,
-		SkipTimeoutCommit:            false,
-		CreateEmptyBlocks:            true,
-		CreateEmptyBlocksInterval:    0 * time.Second,
-		PeerGossipSleepDuration:      100 * time.Millisecond,
-		PeerQueryMaj23SleepDuration:  2000 * time.Millisecond,
-		DoubleSignCheckHeight:        0,
-		UseWeightedProposerSelection: false,
+		WalPath:                     filepath.Join(defaultDataDir, "cs.wal", "wal"),
+		TimeoutPropose:              3000 * time.Millisecond,
+		TimeoutProposeDelta:         500 * time.Millisecond,
+		TimeoutPrevote:              1000 * time.Millisecond,
+		TimeoutPrevoteDelta:         500 * time.Millisecond,
+		TimeoutPrecommit:            1000 * time.Millisecond,
+		TimeoutPrecommitDelta:       500 * time.Millisecond,
+		TimeoutCommit:               1000 * time.Millisecond,
+		SkipTimeoutCommit:           false,
+		CreateEmptyBlocks:           true,
+		CreateEmptyBlocksInterval:   0 * time.Second,
+		PeerGossipSleepDuration:     100 * time.Millisecond,
+		PeerQueryMaj23SleepDuration: 2000 * time.Millisecond,
+		DoubleSignCheckHeight:       int64(0),
 	}
 }
 
@@ -989,8 +985,7 @@ func TestConsensusConfig() *ConsensusConfig {
 	cfg.SkipTimeoutCommit = true
 	cfg.PeerGossipSleepDuration = 5 * time.Millisecond
 	cfg.PeerQueryMaj23SleepDuration = 250 * time.Millisecond
-	cfg.DoubleSignCheckHeight = 0
-	cfg.UseWeightedProposerSelection = true
+	cfg.DoubleSignCheckHeight = int64(0)
 	return cfg
 }
 

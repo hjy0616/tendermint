@@ -975,23 +975,26 @@ func (cs *State) handleTxsAvailable() {
 // NOTE: cs.StartTime was already set for height.
 func (cs *State) enterNewRound(height int64, round int32) {
 	logger := cs.Logger.With("height", height, "round", round)
+
+	if cs.Height != height || round < cs.Round || (cs.Round == round && cs.Step != cstypes.RoundStepNewHeight) {
+		logger.Debug(
+			"entering new round with invalid args",
+			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
+		)
+		return
+	}
+
+	if now := tmtime.Now(); cs.StartTime.After(now) {
+		logger.Debug("need to set a buffer and log message here for sanity", "start_time", cs.StartTime, "now", now)
+	}
+
 	logger.Debug("entering new round", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
 
 	// increment validators if necessary
 	validators := cs.Validators
 	if cs.Round < round {
 		validators = validators.Copy()
-
-		// Use new weighted selection algorithm instead of incrementing proposer priority
-		// This will select a proposer based on voting power and deterministic randomness
-		if cs.config.UseWeightedProposerSelection {
-			// Do not increment proposer priority, as we'll use the weighted selection method
-			// Just set the proposer using weighted selection
-			validators.Proposer = validators.SelectProposerWeighted(height, int64(round))
-		} else {
-			// Use the original proposer selection method
-			validators.IncrementProposerPriority(tmmath.SafeSubInt32(round, cs.Round))
-		}
+		validators.IncrementProposerPriority(tmmath.SafeSubInt32(round, cs.Round))
 	}
 
 	// Setup new round
@@ -1115,13 +1118,7 @@ func (cs *State) enterPropose(height int64, round int32) {
 }
 
 func (cs *State) isProposer(address []byte) bool {
-	if cs.config.UseWeightedProposerSelection {
-		// For weighted selection, we simply compare with the already selected proposer
-		return bytes.Equal(cs.Validators.GetProposer().Address, address)
-	} else {
-		// Original proposer selection logic
-		return bytes.Equal(cs.Validators.GetProposer().Address, address)
-	}
+	return bytes.Equal(cs.Validators.GetProposer().Address, address)
 }
 
 func (cs *State) defaultDecideProposal(height int64, round int32) {
