@@ -4,13 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"runtime/debug"
-	"sort"
 	"time"
-
-	"github.com/gogo/protobuf/proto"
 
 	cfg "github.com/tendermint/tendermint/config"
 	cstypes "github.com/tendermint/tendermint/consensus/types"
@@ -24,7 +19,6 @@ import (
 	"github.com/tendermint/tendermint/libs/service"
 	tmsync "github.com/tendermint/tendermint/libs/sync"
 	"github.com/tendermint/tendermint/p2p"
-	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
 	tmtime "github.com/tendermint/tendermint/types/time"
@@ -140,6 +134,10 @@ type State struct {
 
 	// for reporting metrics
 	metrics *Metrics
+
+	// 커스텀 제안자 선택 모드
+	proposerSelectionMode ProposerSelectionMode
+	lastProposerIndex     int // 마지막 제안자 인덱스 (순환 모드에서 사용)
 }
 
 // StateOption sets an optional parameter on the State.
@@ -156,20 +154,22 @@ func NewState(
 	options ...StateOption,
 ) *State {
 	cs := &State{
-		config:           config,
-		blockExec:        blockExec,
-		blockStore:       blockStore,
-		txNotifier:       txNotifier,
-		peerMsgQueue:     make(chan msgInfo, msgQueueSize),
-		internalMsgQueue: make(chan msgInfo, msgQueueSize),
-		timeoutTicker:    NewTimeoutTicker(),
-		statsMsgQueue:    make(chan msgInfo, msgQueueSize),
-		done:             make(chan struct{}),
-		doWALCatchup:     true,
-		wal:              nilWAL{},
-		evpool:           evpool,
-		evsw:             tmevents.NewEventSwitch(),
-		metrics:          NopMetrics(),
+		config:                config,
+		blockExec:             blockExec,
+		blockStore:            blockStore,
+		txNotifier:            txNotifier,
+		peerMsgQueue:          make(chan msgInfo, msgQueueSize),
+		internalMsgQueue:      make(chan msgInfo, msgQueueSize),
+		timeoutTicker:         NewTimeoutTicker(),
+		statsMsgQueue:         make(chan msgInfo, msgQueueSize),
+		done:                  make(chan struct{}),
+		doWALCatchup:          true,
+		wal:                   nilWAL{},
+		evpool:                evpool,
+		evsw:                  tmevents.NewEventSwitch(),
+		metrics:               NopMetrics(),
+		proposerSelectionMode: DefaultProposerSelection, // 기본값은 Tendermint 기본 알고리즘
+		lastProposerIndex:     -1,
 	}
 
 	// set function defaults (may be overwritten before calling Start)
@@ -1118,1260 +1118,110 @@ func (cs *State) enterPropose(height int64, round int32) {
 }
 
 func (cs *State) isProposer(address []byte) bool {
-	return bytes.Equal(cs.Validators.GetProposer().Address, address)
+	return IsProposer(address, cs.Validators, cs.Validators.GetProposer().Index)
 }
 
 func (cs *State) defaultDecideProposal(height int64, round int32) {
-	var block *types.Block
-	var blockParts *types.PartSet
+	var proposer *types.Validator
 
-	// Decide on block
-	if cs.ValidBlock != nil {
-		// If there is valid block, choose that.
-		block, blockParts = cs.ValidBlock, cs.ValidBlockParts
+	// 사용할 제안자 선택 모드 결정
+	proposerSelectionMode := cs.proposerSelectionMode
+	if proposerSelectionMode == DefaultProposerSelection {
+		// 기존 Tendermint 방식 사용 (아래 로직)
+		proposer = cs.Validators.GetProposer()
+		cs.Logger.Info("Proposer selected using default Tendermint algorithm",
+			"proposer", proposer.Address,
+			"proposer_index", proposer.Index)
 	} else {
-		// Create a new proposal block from state/txs from the mempool.
-		block, blockParts = cs.createProposalBlock()
-		if block == nil {
-			return
-		}
-	}
-
-	// Flush the WAL. Otherwise, we may not recompute the same proposal to sign,
-	// and the privValidator will refuse to sign anything.
-	if err := cs.wal.FlushAndSync(); err != nil {
-		cs.Logger.Error("failed flushing WAL to disk")
-	}
-
-	// Make proposal
-	propBlockID := types.BlockID{Hash: block.Hash(), PartSetHeader: blockParts.Header()}
-	proposal := types.NewProposal(height, round, cs.ValidRound, propBlockID)
-	p := proposal.ToProto()
-	if err := cs.privValidator.SignProposal(cs.state.ChainID, p); err == nil {
-		proposal.Signature = p.Signature
-
-		// send proposal and block parts on internal msg queue
-		cs.sendInternalMessage(msgInfo{&ProposalMessage{proposal}, ""})
-
-		for i := 0; i < int(blockParts.Total()); i++ {
-			part := blockParts.GetPart(i)
-			cs.sendInternalMessage(msgInfo{&BlockPartMessage{cs.Height, cs.Round, part}, ""})
-		}
-
-		cs.Logger.Debug("signed proposal", "height", height, "round", round, "proposal", proposal)
-	} else if !cs.replayMode {
-		cs.Logger.Error("propose step; failed signing proposal", "height", height, "round", round, "err", err)
-	}
-}
-
-// Returns true if the proposal block is complete &&
-// (if POLRound was proposed, we have +2/3 prevotes from there).
-func (cs *State) isProposalComplete() bool {
-	if cs.Proposal == nil || cs.ProposalBlock == nil {
-		return false
-	}
-	// we have the proposal. if there's a POLRound,
-	// make sure we have the prevotes from it too
-	if cs.Proposal.POLRound < 0 {
-		return true
-	}
-	// if this is false the proposer is lying or we haven't received the POL yet
-	return cs.Votes.Prevotes(cs.Proposal.POLRound).HasTwoThirdsMajority()
-}
-
-// Create the next block to propose and return it. Returns nil block upon error.
-//
-// We really only need to return the parts, but the block is returned for
-// convenience so we can log the proposal block.
-//
-// NOTE: keep it side-effect free for clarity.
-// CONTRACT: cs.privValidator is not nil.
-func (cs *State) createProposalBlock() (block *types.Block, blockParts *types.PartSet) {
-	if cs.privValidator == nil {
-		panic("entered createProposalBlock with privValidator being nil")
-	}
-
-	var commit *types.Commit
-	switch {
-	case cs.Height == cs.state.InitialHeight:
-		// We're creating a proposal for the first block.
-		// The commit is empty, but not nil.
-		commit = types.NewCommit(0, 0, types.BlockID{}, nil)
-
-	case cs.LastCommit.HasTwoThirdsMajority():
-		// Make the commit from LastCommit
-		commit = cs.LastCommit.MakeCommit()
-
-	default: // This shouldn't happen.
-		cs.Logger.Error("propose step; cannot propose anything without commit for the previous block")
-		return
-	}
-
-	if cs.privValidatorPubKey == nil {
-		// If this node is a validator & proposer in the current round, it will
-		// miss the opportunity to create a block.
-		cs.Logger.Error("propose step; empty priv validator public key", "err", errPubKeyIsNotSet)
-		return
-	}
-
-	proposerAddr := cs.privValidatorPubKey.Address()
-
-	return cs.blockExec.CreateProposalBlock(cs.Height, cs.state, commit, proposerAddr)
-}
-
-// Enter: `timeoutPropose` after entering Propose.
-// Enter: proposal block and POL is ready.
-// Prevote for LockedBlock if we're locked, or ProposalBlock if valid.
-// Otherwise vote nil.
-func (cs *State) enterPrevote(height int64, round int32) {
-	logger := cs.Logger.With("height", height, "round", round)
-
-	if cs.Height != height || round < cs.Round || (cs.Round == round && cstypes.RoundStepPrevote <= cs.Step) {
-		logger.Debug(
-			"entering prevote step with invalid args",
-			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
+		// 커스텀 제안자 선택 알고리즘 사용
+		proposerIndex := SelectProposer(
+			cs.Validators,
+			height,
+			round,
+			proposerSelectionMode,
+			cs.lastProposerIndex,
 		)
-		return
-	}
 
-	defer func() {
-		// Done enterPrevote:
-		cs.updateRoundStep(round, cstypes.RoundStepPrevote)
-		cs.newStep()
-	}()
+		if proposerIndex >= 0 && proposerIndex < cs.Validators.Size() {
+			proposer = cs.Validators.Validators[proposerIndex]
+			cs.lastProposerIndex = proposerIndex
 
-	logger.Debug("entering prevote step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
+			selectionMode := "unknown"
+			switch proposerSelectionMode {
+			case PriorityBasedSelection:
+				selectionMode = "priority-based"
+			case WeightedSelection:
+				selectionMode = "weighted"
+			case RotationSelection:
+				selectionMode = "rotation"
+			}
 
-	// Sign and broadcast vote as necessary
-	cs.doPrevote(height, round)
+			cs.Logger.Info("Proposer selected using custom algorithm",
+				"algorithm", selectionMode,
+				"proposer", proposer.Address,
+				"proposer_index", proposerIndex,
+				"voting_power", proposer.VotingPower)
 
-	// Once `addVote` hits any +2/3 prevotes, we will go to PrevoteWait
-	// (so we have more time to try and collect +2/3 prevotes for a single block)
-}
-
-func (cs *State) defaultDoPrevote(height int64, round int32) {
-	logger := cs.Logger.With("height", height, "round", round)
-
-	// If a block is locked, prevote that.
-	if cs.LockedBlock != nil {
-		logger.Debug("prevote step; already locked on a block; prevoting locked block")
-		cs.signAddVote(tmproto.PrevoteType, cs.LockedBlock.Hash(), cs.LockedBlockParts.Header())
-		return
-	}
-
-	// If ProposalBlock is nil, prevote nil.
-	if cs.ProposalBlock == nil {
-		logger.Debug("prevote step: ProposalBlock is nil")
-		cs.signAddVote(tmproto.PrevoteType, nil, types.PartSetHeader{})
-		return
-	}
-
-	// Validate proposal block
-	err := cs.blockExec.ValidateBlock(cs.state, cs.ProposalBlock)
-	if err != nil {
-		// ProposalBlock is invalid, prevote nil.
-		logger.Error("prevote step: ProposalBlock is invalid", "err", err)
-		cs.signAddVote(tmproto.PrevoteType, nil, types.PartSetHeader{})
-		return
-	}
-
-	// Prevote cs.ProposalBlock
-	// NOTE: the proposal signature is validated when it is received,
-	// and the proposal block parts are validated as they are received (against the merkle hash in the proposal)
-	logger.Debug("prevote step: ProposalBlock is valid")
-	cs.signAddVote(tmproto.PrevoteType, cs.ProposalBlock.Hash(), cs.ProposalBlockParts.Header())
-}
-
-// Enter: any +2/3 prevotes at next round.
-func (cs *State) enterPrevoteWait(height int64, round int32) {
-	logger := cs.Logger.With("height", height, "round", round)
-
-	if cs.Height != height || round < cs.Round || (cs.Round == round && cstypes.RoundStepPrevoteWait <= cs.Step) {
-		logger.Debug(
-			"entering prevote wait step with invalid args",
-			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
-		)
-		return
-	}
-
-	if !cs.Votes.Prevotes(round).HasTwoThirdsAny() {
-		panic(fmt.Sprintf(
-			"entering prevote wait step (%v/%v), but prevotes does not have any +2/3 votes",
-			height, round,
-		))
-	}
-
-	logger.Debug("entering prevote wait step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
-
-	defer func() {
-		// Done enterPrevoteWait:
-		cs.updateRoundStep(round, cstypes.RoundStepPrevoteWait)
-		cs.newStep()
-	}()
-
-	// Wait for some more prevotes; enterPrecommit
-	cs.scheduleTimeout(cs.config.Prevote(round), height, round, cstypes.RoundStepPrevoteWait)
-}
-
-// Enter: `timeoutPrevote` after any +2/3 prevotes.
-// Enter: `timeoutPrecommit` after any +2/3 precommits.
-// Enter: +2/3 precomits for block or nil.
-// Lock & precommit the ProposalBlock if we have enough prevotes for it (a POL in this round)
-// else, unlock an existing lock and precommit nil if +2/3 of prevotes were nil,
-// else, precommit nil otherwise.
-func (cs *State) enterPrecommit(height int64, round int32) {
-	logger := cs.Logger.With("height", height, "round", round)
-
-	if cs.Height != height || round < cs.Round || (cs.Round == round && cstypes.RoundStepPrecommit <= cs.Step) {
-		logger.Debug(
-			"entering precommit step with invalid args",
-			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
-		)
-		return
-	}
-
-	logger.Debug("entering precommit step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
-
-	defer func() {
-		// Done enterPrecommit:
-		cs.updateRoundStep(round, cstypes.RoundStepPrecommit)
-		cs.newStep()
-	}()
-
-	// check for a polka
-	blockID, ok := cs.Votes.Prevotes(round).TwoThirdsMajority()
-
-	// If we don't have a polka, we must precommit nil.
-	if !ok {
-		if cs.LockedBlock != nil {
-			logger.Debug("precommit step; no +2/3 prevotes during enterPrecommit while we are locked; precommitting nil")
+			// 우선순위 업데이트 (필요한 모드에 한해)
+			if proposerSelectionMode == PriorityBasedSelection {
+				UpdateProposerPriorities(proposerIndex, cs.Validators)
+			}
 		} else {
-			logger.Debug("precommit step; no +2/3 prevotes during enterPrecommit; precommitting nil")
+			// 유효하지 않은 인덱스가 반환된 경우, 기본 Tendermint 방식으로 폴백
+			proposer = cs.Validators.GetProposer()
+			cs.Logger.Error("Failed to select proposer using custom algorithm, falling back to default",
+				"height", height,
+				"round", round)
 		}
+	}
 
-		cs.signAddVote(tmproto.PrecommitType, nil, types.PartSetHeader{})
+	// if not a validator, we're done
+	if !cs.Validators.HasAddress(cs.privValidator.GetPubKey().Address()) {
+		cs.Logger.Debug("This node is not a validator", "addr", cs.privValidator.GetPubKey().Address())
+		cs.Proposal = nil
+		cs.ProposerAddress = proposer.Address
 		return
 	}
 
-	// At this point +2/3 prevoted for a particular block or nil.
-	if err := cs.eventBus.PublishEventPolka(cs.RoundStateEvent()); err != nil {
-		logger.Error("failed publishing polka", "err", err)
-	}
-
-	// the latest POLRound should be this round.
-	polRound, _ := cs.Votes.POLInfo()
-	if polRound < round {
-		panic(fmt.Sprintf("this POLRound should be %v but got %v", round, polRound))
-	}
-
-	// +2/3 prevoted nil. Unlock and precommit nil.
-	if len(blockID.Hash) == 0 {
-		if cs.LockedBlock == nil {
-			logger.Debug("precommit step; +2/3 prevoted for nil")
-		} else {
-			logger.Debug("precommit step; +2/3 prevoted for nil; unlocking")
-			cs.LockedRound = -1
-			cs.LockedBlock = nil
-			cs.LockedBlockParts = nil
-
-			if err := cs.eventBus.PublishEventUnlock(cs.RoundStateEvent()); err != nil {
-				logger.Error("failed publishing event unlock", "err", err)
-			}
-		}
-
-		cs.signAddVote(tmproto.PrecommitType, nil, types.PartSetHeader{})
+	if !bytes.Equal(proposer.Address, cs.privValidator.GetPubKey().Address()) {
+		cs.Logger.Debug("Not our turn to propose", "proposer", proposer.Address,
+			"privValidator", cs.privValidator.GetPubKey().Address())
+		cs.Proposal = nil
+		cs.ProposerAddress = proposer.Address
 		return
 	}
 
-	// At this point, +2/3 prevoted for a particular block.
-
-	// If we're already locked on that block, precommit it, and update the LockedRound
-	if cs.LockedBlock.HashesTo(blockID.Hash) {
-		logger.Debug("precommit step; +2/3 prevoted locked block; relocking")
-		cs.LockedRound = round
-
-		if err := cs.eventBus.PublishEventRelock(cs.RoundStateEvent()); err != nil {
-			logger.Error("failed publishing event relock", "err", err)
-		}
-
-		cs.signAddVote(tmproto.PrecommitType, blockID.Hash, blockID.PartSetHeader)
-		return
-	}
-
-	// If +2/3 prevoted for proposal block, stage and precommit it
-	if cs.ProposalBlock.HashesTo(blockID.Hash) {
-		logger.Debug("precommit step; +2/3 prevoted proposal block; locking", "hash", blockID.Hash)
-
-		// Validate the block.
-		if err := cs.blockExec.ValidateBlock(cs.state, cs.ProposalBlock); err != nil {
-			panic(fmt.Sprintf("precommit step; +2/3 prevoted for an invalid block: %v", err))
-		}
-
-		cs.LockedRound = round
-		cs.LockedBlock = cs.ProposalBlock
-		cs.LockedBlockParts = cs.ProposalBlockParts
-
-		if err := cs.eventBus.PublishEventLock(cs.RoundStateEvent()); err != nil {
-			logger.Error("failed publishing event lock", "err", err)
-		}
-
-		cs.signAddVote(tmproto.PrecommitType, blockID.Hash, blockID.PartSetHeader)
-		return
-	}
-
-	// There was a polka in this round for a block we don't have.
-	// Fetch that block, unlock, and precommit nil.
-	// The +2/3 prevotes for this round is the POL for our unlock.
-	logger.Debug("precommit step; +2/3 prevotes for a block we do not have; voting nil", "block_id", blockID)
-
-	cs.LockedRound = -1
-	cs.LockedBlock = nil
-	cs.LockedBlockParts = nil
-
-	if !cs.ProposalBlockParts.HasHeader(blockID.PartSetHeader) {
-		cs.ProposalBlock = nil
-		cs.ProposalBlockParts = types.NewPartSetFromHeader(blockID.PartSetHeader)
-	}
-
-	if err := cs.eventBus.PublishEventUnlock(cs.RoundStateEvent()); err != nil {
-		logger.Error("failed publishing event unlock", "err", err)
-	}
-
-	cs.signAddVote(tmproto.PrecommitType, nil, types.PartSetHeader{})
+	cs.Logger.Debug("Our turn to propose", "proposer", proposer.Address,
+		"privValidator", cs.privValidator.GetPubKey().Address())
+	cs.decideProposalContent(height, round)
+	cs.ProposerAddress = proposer.Address
 }
 
-// Enter: any +2/3 precommits for next round.
-func (cs *State) enterPrecommitWait(height int64, round int32) {
-	logger := cs.Logger.With("height", height, "round", round)
+// ... existing code ...
 
-	if cs.Height != height || round < cs.Round || (cs.Round == round && cs.TriggeredTimeoutPrecommit) {
-		logger.Debug(
-			"entering precommit wait step with invalid args",
-			"triggered_timeout", cs.TriggeredTimeoutPrecommit,
-			"current", log.NewLazySprintf("%v/%v", cs.Height, cs.Round),
-		)
-		return
-	}
-
-	if !cs.Votes.Precommits(round).HasTwoThirdsAny() {
-		panic(fmt.Sprintf(
-			"entering precommit wait step (%v/%v), but precommits does not have any +2/3 votes",
-			height, round,
-		))
-	}
-
-	logger.Debug("entering precommit wait step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
-
-	defer func() {
-		// Done enterPrecommitWait:
-		cs.TriggeredTimeoutPrecommit = true
-		cs.newStep()
-	}()
-
-	// wait for some more precommits; enterNewRound
-	cs.scheduleTimeout(cs.config.Precommit(round), height, round, cstypes.RoundStepPrecommitWait)
+// isProposer returns if our pubkey is the same as the proposer's pubkey
+func (cs *State) isProposer(address []byte) bool {
+	return IsProposer(address, cs.Validators, cs.Validators.GetProposer().Index)
 }
 
-// Enter: +2/3 precommits for block
-func (cs *State) enterCommit(height int64, commitRound int32) {
-	logger := cs.Logger.With("height", height, "commit_round", commitRound)
+// ... existing code ...
 
-	if cs.Height != height || cstypes.RoundStepCommit <= cs.Step {
-		logger.Debug(
-			"entering commit step with invalid args",
-			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
-		)
-		return
-	}
+// SetProposerSelectionMode 커스텀 제안자 선택 모드 설정
+func (cs *State) SetProposerSelectionMode(mode ProposerSelectionMode) {
+	cs.mtx.Lock()
+	defer cs.mtx.Unlock()
 
-	logger.Debug("entering commit step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
+	prevMode := cs.proposerSelectionMode
+	cs.proposerSelectionMode = mode
 
-	defer func() {
-		// Done enterCommit:
-		// keep cs.Round the same, commitRound points to the right Precommits set.
-		cs.updateRoundStep(cs.Round, cstypes.RoundStepCommit)
-		cs.CommitRound = commitRound
-		cs.CommitTime = tmtime.Now()
-		cs.newStep()
-
-		// Maybe finalize immediately.
-		cs.tryFinalizeCommit(height)
-	}()
-
-	blockID, ok := cs.Votes.Precommits(commitRound).TwoThirdsMajority()
-	if !ok {
-		panic("RunActionCommit() expects +2/3 precommits")
-	}
-
-	// The Locked* fields no longer matter.
-	// Move them over to ProposalBlock if they match the commit hash,
-	// otherwise they'll be cleared in updateToState.
-	if cs.LockedBlock.HashesTo(blockID.Hash) {
-		logger.Debug("commit is for a locked block; set ProposalBlock=LockedBlock", "block_hash", blockID.Hash)
-		cs.ProposalBlock = cs.LockedBlock
-		cs.ProposalBlockParts = cs.LockedBlockParts
-	}
-
-	// If we don't have the block being committed, set up to get it.
-	if !cs.ProposalBlock.HashesTo(blockID.Hash) {
-		if !cs.ProposalBlockParts.HasHeader(blockID.PartSetHeader) {
-			logger.Info(
-				"commit is for a block we do not know about; set ProposalBlock=nil",
-				"proposal", log.NewLazyBlockHash(cs.ProposalBlock),
-				"commit", blockID.Hash,
-			)
-
-			// We're getting the wrong block.
-			// Set up ProposalBlockParts and keep waiting.
-			cs.ProposalBlock = nil
-			cs.ProposalBlockParts = types.NewPartSetFromHeader(blockID.PartSetHeader)
-
-			if err := cs.eventBus.PublishEventValidBlock(cs.RoundStateEvent()); err != nil {
-				logger.Error("failed publishing valid block", "err", err)
-			}
-
-			cs.evsw.FireEvent(types.EventValidBlock, &cs.RoundState)
-		}
-	}
+	cs.Logger.Info("Proposer selection mode changed",
+		"prev_mode", prevMode,
+		"new_mode", mode)
 }
 
-// If we have the block AND +2/3 commits for it, finalize.
-func (cs *State) tryFinalizeCommit(height int64) {
-	logger := cs.Logger.With("height", height)
-
-	if cs.Height != height {
-		panic(fmt.Sprintf("tryFinalizeCommit() cs.Height: %v vs height: %v", cs.Height, height))
-	}
-
-	blockID, ok := cs.Votes.Precommits(cs.CommitRound).TwoThirdsMajority()
-	if !ok || len(blockID.Hash) == 0 {
-		logger.Error("failed attempt to finalize commit; there was no +2/3 majority or +2/3 was for nil")
-		return
-	}
-
-	if !cs.ProposalBlock.HashesTo(blockID.Hash) {
-		// TODO: this happens every time if we're not a validator (ugly logs)
-		// TODO: ^^ wait, why does it matter that we're a validator?
-		logger.Debug(
-			"failed attempt to finalize commit; we do not have the commit block",
-			"proposal_block", log.NewLazyBlockHash(cs.ProposalBlock),
-			"commit_block", blockID.Hash,
-		)
-		return
-	}
-
-	cs.finalizeCommit(height)
-}
-
-// Increment height and goto cstypes.RoundStepNewHeight
-func (cs *State) finalizeCommit(height int64) {
-	logger := cs.Logger.With("height", height)
-
-	if cs.Height != height || cs.Step != cstypes.RoundStepCommit {
-		logger.Debug(
-			"entering finalize commit step",
-			"current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step),
-		)
-		return
-	}
-
-	cs.calculatePrevoteMessageDelayMetrics()
-
-	blockID, ok := cs.Votes.Precommits(cs.CommitRound).TwoThirdsMajority()
-	block, blockParts := cs.ProposalBlock, cs.ProposalBlockParts
-
-	if !ok {
-		panic("cannot finalize commit; commit does not have 2/3 majority")
-	}
-	if !blockParts.HasHeader(blockID.PartSetHeader) {
-		panic("expected ProposalBlockParts header to be commit header")
-	}
-	if !block.HashesTo(blockID.Hash) {
-		panic("cannot finalize commit; proposal block does not hash to commit hash")
-	}
-
-	if err := cs.blockExec.ValidateBlock(cs.state, block); err != nil {
-		panic(fmt.Errorf("+2/3 committed an invalid block: %w", err))
-	}
-
-	logger.Info(
-		"finalizing commit of block",
-		"hash", log.NewLazyBlockHash(block),
-		"root", block.AppHash,
-		"num_txs", len(block.Txs),
-	)
-	logger.Debug("committed block", "block", log.NewLazySprintf("%v", block))
-
-	fail.Fail() // XXX
-
-	// Save to blockStore.
-	if cs.blockStore.Height() < block.Height {
-		// NOTE: the seenCommit is local justification to commit this block,
-		// but may differ from the LastCommit included in the next block
-		precommits := cs.Votes.Precommits(cs.CommitRound)
-		seenCommit := precommits.MakeCommit()
-		cs.blockStore.SaveBlock(block, blockParts, seenCommit)
-	} else {
-		// Happens during replay if we already saved the block but didn't commit
-		logger.Debug("calling finalizeCommit on already stored block", "height", block.Height)
-	}
-
-	fail.Fail() // XXX
-
-	// Write EndHeightMessage{} for this height, implying that the blockstore
-	// has saved the block.
-	//
-	// If we crash before writing this EndHeightMessage{}, we will recover by
-	// running ApplyBlock during the ABCI handshake when we restart.  If we
-	// didn't save the block to the blockstore before writing
-	// EndHeightMessage{}, we'd have to change WAL replay -- currently it
-	// complains about replaying for heights where an #ENDHEIGHT entry already
-	// exists.
-	//
-	// Either way, the State should not be resumed until we
-	// successfully call ApplyBlock (ie. later here, or in Handshake after
-	// restart).
-	endMsg := EndHeightMessage{height}
-	if err := cs.wal.WriteSync(endMsg); err != nil { // NOTE: fsync
-		panic(fmt.Sprintf(
-			"failed to write %v msg to consensus WAL due to %v; check your file system and restart the node",
-			endMsg, err,
-		))
-	}
-
-	fail.Fail() // XXX
-
-	// Create a copy of the state for staging and an event cache for txs.
-	stateCopy := cs.state.Copy()
-
-	// Execute and commit the block, update and save the state, and update the mempool.
-	// NOTE The block.AppHash wont reflect these txs until the next block.
-	var (
-		err          error
-		retainHeight int64
-	)
-
-	stateCopy, retainHeight, err = cs.blockExec.ApplyBlock(
-		stateCopy,
-		types.BlockID{
-			Hash:          block.Hash(),
-			PartSetHeader: blockParts.Header(),
-		},
-		block,
-	)
-	if err != nil {
-		logger.Error("failed to apply block", "err", err)
-		return
-	}
-
-	fail.Fail() // XXX
-
-	// Prune old heights, if requested by ABCI app.
-	if retainHeight > 0 {
-		pruned, err := cs.pruneBlocks(retainHeight)
-		if err != nil {
-			logger.Error("failed to prune blocks", "retain_height", retainHeight, "err", err)
-		} else {
-			logger.Debug("pruned blocks", "pruned", pruned, "retain_height", retainHeight)
-		}
-	}
-
-	// must be called before we update state
-	cs.recordMetrics(height, block)
-
-	// NewHeightStep!
-	cs.updateToState(stateCopy)
-
-	fail.Fail() // XXX
-
-	// Private validator might have changed it's key pair => refetch pubkey.
-	if err := cs.updatePrivValidatorPubKey(); err != nil {
-		logger.Error("failed to get private validator pubkey", "err", err)
-	}
-
-	// cs.StartTime is already set.
-	// Schedule Round0 to start soon.
-	cs.scheduleRound0(&cs.RoundState)
-
-	// By here,
-	// * cs.Height has been increment to height+1
-	// * cs.Step is now cstypes.RoundStepNewHeight
-	// * cs.StartTime is set to when we will start round0.
-}
-
-func (cs *State) pruneBlocks(retainHeight int64) (uint64, error) {
-	base := cs.blockStore.Base()
-	if retainHeight <= base {
-		return 0, nil
-	}
-	pruned, err := cs.blockStore.PruneBlocks(retainHeight)
-	if err != nil {
-		return 0, fmt.Errorf("failed to prune block store: %w", err)
-	}
-	err = cs.blockExec.Store().PruneStates(base, retainHeight)
-	if err != nil {
-		return 0, fmt.Errorf("failed to prune state database: %w", err)
-	}
-	return pruned, nil
-}
-
-func (cs *State) recordMetrics(height int64, block *types.Block) {
-	cs.metrics.Validators.Set(float64(cs.Validators.Size()))
-	cs.metrics.ValidatorsPower.Set(float64(cs.Validators.TotalVotingPower()))
-
-	var (
-		missingValidators      int
-		missingValidatorsPower int64
-	)
-	// height=0 -> MissingValidators and MissingValidatorsPower are both 0.
-	// Remember that the first LastCommit is intentionally empty, so it's not
-	// fair to increment missing validators number.
-	if height > cs.state.InitialHeight {
-		// Sanity check that commit size matches validator set size - only applies
-		// after first block.
-		var (
-			commitSize = block.LastCommit.Size()
-			valSetLen  = len(cs.LastValidators.Validators)
-			address    types.Address
-		)
-		if commitSize != valSetLen {
-			panic(fmt.Sprintf("commit size (%d) doesn't match valset length (%d) at height %d\n\n%v\n\n%v",
-				commitSize, valSetLen, block.Height, block.LastCommit.Signatures, cs.LastValidators.Validators))
-		}
-
-		if cs.privValidator != nil {
-			if cs.privValidatorPubKey == nil {
-				// Metrics won't be updated, but it's not critical.
-				cs.Logger.Error(fmt.Sprintf("recordMetrics: %v", errPubKeyIsNotSet))
-			} else {
-				address = cs.privValidatorPubKey.Address()
-			}
-		}
-
-		for i, val := range cs.LastValidators.Validators {
-			commitSig := block.LastCommit.Signatures[i]
-			if commitSig.Absent() {
-				missingValidators++
-				missingValidatorsPower += val.VotingPower
-			}
-
-			if bytes.Equal(val.Address, address) {
-				label := []string{
-					"validator_address", val.Address.String(),
-				}
-				cs.metrics.ValidatorPower.With(label...).Set(float64(val.VotingPower))
-				if commitSig.ForBlock() {
-					cs.metrics.ValidatorLastSignedHeight.With(label...).Set(float64(height))
-				} else {
-					cs.metrics.ValidatorMissedBlocks.With(label...).Add(float64(1))
-				}
-			}
-
-		}
-	}
-	cs.metrics.MissingValidators.Set(float64(missingValidators))
-	cs.metrics.MissingValidatorsPower.Set(float64(missingValidatorsPower))
-
-	// NOTE: byzantine validators power and count is only for consensus evidence i.e. duplicate vote
-	var (
-		byzantineValidatorsPower = int64(0)
-		byzantineValidatorsCount = int64(0)
-	)
-	for _, ev := range block.Evidence.Evidence {
-		if dve, ok := ev.(*types.DuplicateVoteEvidence); ok {
-			if _, val := cs.Validators.GetByAddress(dve.VoteA.ValidatorAddress); val != nil {
-				byzantineValidatorsCount++
-				byzantineValidatorsPower += val.VotingPower
-			}
-		}
-	}
-	cs.metrics.ByzantineValidators.Set(float64(byzantineValidatorsCount))
-	cs.metrics.ByzantineValidatorsPower.Set(float64(byzantineValidatorsPower))
-
-	if height > 1 {
-		lastBlockMeta := cs.blockStore.LoadBlockMeta(height - 1)
-		if lastBlockMeta != nil {
-			cs.metrics.BlockIntervalSeconds.Observe(
-				block.Time.Sub(lastBlockMeta.Header.Time).Seconds(),
-			)
-		}
-	}
-
-	cs.metrics.NumTxs.Set(float64(len(block.Data.Txs)))
-	cs.metrics.TotalTxs.Add(float64(len(block.Data.Txs)))
-	cs.metrics.BlockSizeBytes.Set(float64(block.Size()))
-	cs.metrics.CommittedHeight.Set(float64(block.Height))
-}
-
-//-----------------------------------------------------------------------------
-
-func (cs *State) defaultSetProposal(proposal *types.Proposal) error {
-	// Already have one
-	// TODO: possibly catch double proposals
-	if cs.Proposal != nil {
-		return nil
-	}
-
-	// Does not apply
-	if proposal.Height != cs.Height || proposal.Round != cs.Round {
-		return nil
-	}
-
-	// Verify POLRound, which must be -1 or in range [0, proposal.Round).
-	if proposal.POLRound < -1 ||
-		(proposal.POLRound >= 0 && proposal.POLRound >= proposal.Round) {
-		return ErrInvalidProposalPOLRound
-	}
-
-	p := proposal.ToProto()
-	// Verify signature
-	if !cs.Validators.GetProposer().PubKey.VerifySignature(
-		types.ProposalSignBytes(cs.state.ChainID, p), proposal.Signature,
-	) {
-		return ErrInvalidProposalSignature
-	}
-
-	proposal.Signature = p.Signature
-	cs.Proposal = proposal
-	// We don't update cs.ProposalBlockParts if it is already set.
-	// This happens if we're already in cstypes.RoundStepCommit or if there is a valid block in the current round.
-	// TODO: We can check if Proposal is for a different block as this is a sign of misbehavior!
-	if cs.ProposalBlockParts == nil {
-		cs.ProposalBlockParts = types.NewPartSetFromHeader(proposal.BlockID.PartSetHeader)
-	}
-
-	cs.Logger.Info("received proposal", "proposal", proposal)
-	return nil
-}
-
-// NOTE: block is not necessarily valid.
-// Asynchronously triggers either enterPrevote (before we timeout of propose) or tryFinalizeCommit,
-// once we have the full block.
-func (cs *State) addProposalBlockPart(msg *BlockPartMessage, peerID p2p.ID) (added bool, err error) {
-	height, round, part := msg.Height, msg.Round, msg.Part
-
-	// Blocks might be reused, so round mismatch is OK
-	if cs.Height != height {
-		cs.Logger.Debug("received block part from wrong height", "height", height, "round", round)
-		return false, nil
-	}
-
-	// We're not expecting a block part.
-	if cs.ProposalBlockParts == nil {
-		// NOTE: this can happen when we've gone to a higher round and
-		// then receive parts from the previous round - not necessarily a bad peer.
-		cs.Logger.Debug(
-			"received a block part when we are not expecting any",
-			"height", height,
-			"round", round,
-			"index", part.Index,
-			"peer", peerID,
-		)
-		return false, nil
-	}
-
-	added, err = cs.ProposalBlockParts.AddPart(part)
-	if err != nil {
-		return added, err
-	}
-	if cs.ProposalBlockParts.ByteSize() > cs.state.ConsensusParams.Block.MaxBytes {
-		return added, fmt.Errorf("total size of proposal block parts exceeds maximum block bytes (%d > %d)",
-			cs.ProposalBlockParts.ByteSize(), cs.state.ConsensusParams.Block.MaxBytes,
-		)
-	}
-	if added && cs.ProposalBlockParts.IsComplete() {
-		bz, err := io.ReadAll(cs.ProposalBlockParts.GetReader())
-		if err != nil {
-			return added, err
-		}
-
-		pbb := new(tmproto.Block)
-		err = proto.Unmarshal(bz, pbb)
-		if err != nil {
-			return added, err
-		}
-
-		block, err := types.BlockFromProto(pbb)
-		if err != nil {
-			return added, err
-		}
-
-		cs.ProposalBlock = block
-
-		// NOTE: it's possible to receive complete proposal blocks for future rounds without having the proposal
-		cs.Logger.Info("received complete proposal block", "height", cs.ProposalBlock.Height, "hash", cs.ProposalBlock.Hash())
-
-		if err := cs.eventBus.PublishEventCompleteProposal(cs.CompleteProposalEvent()); err != nil {
-			cs.Logger.Error("failed publishing event complete proposal", "err", err)
-		}
-	}
-	return added, nil
-}
-
-func (cs *State) handleCompleteProposal(blockHeight int64) {
-	// Update Valid* if we can.
-	prevotes := cs.Votes.Prevotes(cs.Round)
-	blockID, hasTwoThirds := prevotes.TwoThirdsMajority()
-	if hasTwoThirds && !blockID.IsZero() && (cs.ValidRound < cs.Round) {
-		if cs.ProposalBlock.HashesTo(blockID.Hash) {
-			cs.Logger.Debug(
-				"updating valid block to new proposal block",
-				"valid_round", cs.Round,
-				"valid_block_hash", log.NewLazyBlockHash(cs.ProposalBlock),
-			)
-
-			cs.ValidRound = cs.Round
-			cs.ValidBlock = cs.ProposalBlock
-			cs.ValidBlockParts = cs.ProposalBlockParts
-		}
-		// TODO: In case there is +2/3 majority in Prevotes set for some
-		// block and cs.ProposalBlock contains different block, either
-		// proposer is faulty or voting power of faulty processes is more
-		// than 1/3. We should trigger in the future accountability
-		// procedure at this point.
-	}
-
-	if cs.Step <= cstypes.RoundStepPropose && cs.isProposalComplete() {
-		// Move onto the next step
-		cs.enterPrevote(blockHeight, cs.Round)
-		if hasTwoThirds { // this is optimisation as this will be triggered when prevote is added
-			cs.enterPrecommit(blockHeight, cs.Round)
-		}
-	} else if cs.Step == cstypes.RoundStepCommit {
-		// If we're waiting on the proposal block...
-		cs.tryFinalizeCommit(blockHeight)
-	}
-}
-
-// Attempt to add the vote. if its a duplicate signature, dupeout the validator
-func (cs *State) tryAddVote(vote *types.Vote, peerID p2p.ID) (bool, error) {
-	added, err := cs.addVote(vote, peerID)
-	if err != nil {
-		// If the vote height is off, we'll just ignore it,
-		// But if it's a conflicting sig, add it to the cs.evpool.
-		// If it's otherwise invalid, punish peer.
-		//nolint: gocritic
-		if voteErr, ok := err.(*types.ErrVoteConflictingVotes); ok {
-			if cs.privValidatorPubKey == nil {
-				return false, errPubKeyIsNotSet
-			}
-
-			if bytes.Equal(vote.ValidatorAddress, cs.privValidatorPubKey.Address()) {
-				cs.Logger.Error(
-					"found conflicting vote from ourselves; did you unsafe_reset a validator?",
-					"height", vote.Height,
-					"round", vote.Round,
-					"type", vote.Type,
-				)
-
-				return added, err
-			}
-
-			// report conflicting votes to the evidence pool
-			cs.evpool.ReportConflictingVotes(voteErr.VoteA, voteErr.VoteB)
-			cs.Logger.Debug(
-				"found and sent conflicting votes to the evidence pool",
-				"vote_a", voteErr.VoteA,
-				"vote_b", voteErr.VoteB,
-			)
-
-			return added, err
-		} else if errors.Is(err, types.ErrVoteNonDeterministicSignature) {
-			cs.Logger.Debug("vote has non-deterministic signature", "err", err)
-		} else {
-			// Either
-			// 1) bad peer OR
-			// 2) not a bad peer? this can also err sometimes with "Unexpected step" OR
-			// 3) tmkms use with multiple validators connecting to a single tmkms instance
-			// 		(https://github.com/tendermint/tendermint/issues/3839).
-			cs.Logger.Info("failed attempting to add vote", "err", err)
-			return added, ErrAddingVote
-		}
-	}
-
-	return added, nil
-}
-
-func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error) {
-	cs.Logger.Debug(
-		"adding vote",
-		"vote_height", vote.Height,
-		"vote_type", vote.Type,
-		"val_index", vote.ValidatorIndex,
-		"cs_height", cs.Height,
-	)
-
-	// A precommit for the previous height?
-	// These come in while we wait timeoutCommit
-	if vote.Height+1 == cs.Height && vote.Type == tmproto.PrecommitType {
-		if cs.Step != cstypes.RoundStepNewHeight {
-			// Late precommit at prior height is ignored
-			cs.Logger.Debug("precommit vote came in after commit timeout and has been ignored", "vote", vote)
-			return
-		}
-
-		added, err = cs.LastCommit.AddVote(vote)
-		if !added {
-			return
-		}
-
-		cs.Logger.Debug("added vote to last precommits", "last_commit", cs.LastCommit.StringShort())
-		if err := cs.eventBus.PublishEventVote(types.EventDataVote{Vote: vote}); err != nil {
-			return added, err
-		}
-
-		cs.evsw.FireEvent(types.EventVote, vote)
-
-		// if we can skip timeoutCommit and have all the votes now,
-		if cs.config.SkipTimeoutCommit && cs.LastCommit.HasAll() {
-			// go straight to new round (skip timeout commit)
-			// cs.scheduleTimeout(time.Duration(0), cs.Height, 0, cstypes.RoundStepNewHeight)
-			cs.enterNewRound(cs.Height, 0)
-		}
-
-		return
-	}
-
-	// Height mismatch is ignored.
-	// Not necessarily a bad peer, but not favourable behaviour.
-	if vote.Height != cs.Height {
-		cs.Logger.Debug("vote ignored and not added", "vote_height", vote.Height, "cs_height", cs.Height, "peer", peerID)
-		return
-	}
-
-	height := cs.Height
-	added, err = cs.Votes.AddVote(vote, peerID)
-	if !added {
-		// Either duplicate, or error upon cs.Votes.AddByIndex()
-		return
-	}
-
-	if err := cs.eventBus.PublishEventVote(types.EventDataVote{Vote: vote}); err != nil {
-		return added, err
-	}
-	cs.evsw.FireEvent(types.EventVote, vote)
-
-	switch vote.Type {
-	case tmproto.PrevoteType:
-		prevotes := cs.Votes.Prevotes(vote.Round)
-		cs.Logger.Debug("added vote to prevote", "vote", vote, "prevotes", prevotes.StringShort())
-
-		// If +2/3 prevotes for a block or nil for *any* round:
-		if blockID, ok := prevotes.TwoThirdsMajority(); ok {
-			// There was a polka!
-			// If we're locked but this is a recent polka, unlock.
-			// If it matches our ProposalBlock, update the ValidBlock
-
-			// Unlock if `cs.LockedRound < vote.Round <= cs.Round`
-			// NOTE: If vote.Round > cs.Round, we'll deal with it when we get to vote.Round
-			if (cs.LockedBlock != nil) &&
-				(cs.LockedRound < vote.Round) &&
-				(vote.Round <= cs.Round) &&
-				!cs.LockedBlock.HashesTo(blockID.Hash) {
-
-				cs.Logger.Debug("unlocking because of POL", "locked_round", cs.LockedRound, "pol_round", vote.Round)
-
-				cs.LockedRound = -1
-				cs.LockedBlock = nil
-				cs.LockedBlockParts = nil
-
-				if err := cs.eventBus.PublishEventUnlock(cs.RoundStateEvent()); err != nil {
-					return added, err
-				}
-			}
-
-			// Update Valid* if we can.
-			// NOTE: our proposal block may be nil or not what received a polka..
-			if len(blockID.Hash) != 0 && (cs.ValidRound < vote.Round) && (vote.Round == cs.Round) {
-				if cs.ProposalBlock.HashesTo(blockID.Hash) {
-					cs.Logger.Debug("updating valid block because of POL", "valid_round", cs.ValidRound, "pol_round", vote.Round)
-					cs.ValidRound = vote.Round
-					cs.ValidBlock = cs.ProposalBlock
-					cs.ValidBlockParts = cs.ProposalBlockParts
-				} else {
-					cs.Logger.Debug(
-						"valid block we do not know about; set ProposalBlock=nil",
-						"proposal", log.NewLazyBlockHash(cs.ProposalBlock),
-						"block_id", blockID.Hash,
-					)
-
-					// we're getting the wrong block
-					cs.ProposalBlock = nil
-				}
-
-				if !cs.ProposalBlockParts.HasHeader(blockID.PartSetHeader) {
-					cs.ProposalBlockParts = types.NewPartSetFromHeader(blockID.PartSetHeader)
-				}
-
-				cs.evsw.FireEvent(types.EventValidBlock, &cs.RoundState)
-				if err := cs.eventBus.PublishEventValidBlock(cs.RoundStateEvent()); err != nil {
-					return added, err
-				}
-			}
-		}
-
-		// If +2/3 prevotes for *anything* for future round:
-		switch {
-		case cs.Round < vote.Round && prevotes.HasTwoThirdsAny():
-			// Round-skip if there is any 2/3+ of votes ahead of us
-			cs.enterNewRound(height, vote.Round)
-
-		case cs.Round == vote.Round && cstypes.RoundStepPrevote <= cs.Step: // current round
-			blockID, ok := prevotes.TwoThirdsMajority()
-			if ok && (cs.isProposalComplete() || len(blockID.Hash) == 0) {
-				cs.enterPrecommit(height, vote.Round)
-			} else if prevotes.HasTwoThirdsAny() {
-				cs.enterPrevoteWait(height, vote.Round)
-			}
-
-		case cs.Proposal != nil && 0 <= cs.Proposal.POLRound && cs.Proposal.POLRound == vote.Round:
-			// If the proposal is now complete, enter prevote of cs.Round.
-			if cs.isProposalComplete() {
-				cs.enterPrevote(height, cs.Round)
-			}
-		}
-
-	case tmproto.PrecommitType:
-		precommits := cs.Votes.Precommits(vote.Round)
-		cs.Logger.Debug("added vote to precommit",
-			"height", vote.Height,
-			"round", vote.Round,
-			"validator", vote.ValidatorAddress.String(),
-			"vote_timestamp", vote.Timestamp,
-			"data", precommits.LogString())
-
-		blockID, ok := precommits.TwoThirdsMajority()
-		if ok {
-			// Executed as TwoThirdsMajority could be from a higher round
-			cs.enterNewRound(height, vote.Round)
-			cs.enterPrecommit(height, vote.Round)
-
-			if len(blockID.Hash) != 0 {
-				cs.enterCommit(height, vote.Round)
-				if cs.config.SkipTimeoutCommit && precommits.HasAll() {
-					cs.enterNewRound(cs.Height, 0)
-				}
-			} else {
-				cs.enterPrecommitWait(height, vote.Round)
-			}
-		} else if cs.Round <= vote.Round && precommits.HasTwoThirdsAny() {
-			cs.enterNewRound(height, vote.Round)
-			cs.enterPrecommitWait(height, vote.Round)
-		}
-
-	default:
-		panic(fmt.Sprintf("unexpected vote type %v", vote.Type))
-	}
-
-	return added, err
-}
-
-// CONTRACT: cs.privValidator is not nil.
-func (cs *State) signVote(
-	msgType tmproto.SignedMsgType,
-	hash []byte,
-	header types.PartSetHeader,
-) (*types.Vote, error) {
-	// Flush the WAL. Otherwise, we may not recompute the same vote to sign,
-	// and the privValidator will refuse to sign anything.
-	if err := cs.wal.FlushAndSync(); err != nil {
-		return nil, err
-	}
-
-	if cs.privValidatorPubKey == nil {
-		return nil, errPubKeyIsNotSet
-	}
-
-	addr := cs.privValidatorPubKey.Address()
-	valIdx, _ := cs.Validators.GetByAddress(addr)
-
-	vote := &types.Vote{
-		ValidatorAddress: addr,
-		ValidatorIndex:   valIdx,
-		Height:           cs.Height,
-		Round:            cs.Round,
-		Timestamp:        cs.voteTime(),
-		Type:             msgType,
-		BlockID:          types.BlockID{Hash: hash, PartSetHeader: header},
-	}
-
-	v := vote.ToProto()
-	err := cs.privValidator.SignVote(cs.state.ChainID, v)
-	vote.Signature = v.Signature
-	vote.Timestamp = v.Timestamp
-
-	return vote, err
-}
-
-func (cs *State) voteTime() time.Time {
-	now := tmtime.Now()
-	minVoteTime := now
-	// TODO: We should remove next line in case we don't vote for v in case cs.ProposalBlock == nil,
-	// even if cs.LockedBlock != nil. See https://github.com/tendermint/tendermint/tree/v0.34.x/spec/.
-	timeIota := time.Duration(cs.state.ConsensusParams.Block.TimeIotaMs) * time.Millisecond
-	if cs.LockedBlock != nil {
-		// See the BFT time spec
-		// https://github.com/tendermint/tendermint/blob/v0.34.x/spec/consensus/bft-time.md
-		minVoteTime = cs.LockedBlock.Time.Add(timeIota)
-	} else if cs.ProposalBlock != nil {
-		minVoteTime = cs.ProposalBlock.Time.Add(timeIota)
-	}
-
-	if now.After(minVoteTime) {
-		return now
-	}
-	return minVoteTime
-}
-
-// sign the vote and publish on internalMsgQueue
-func (cs *State) signAddVote(msgType tmproto.SignedMsgType, hash []byte, header types.PartSetHeader) *types.Vote {
-	if cs.privValidator == nil { // the node does not have a key
-		return nil
-	}
-
-	if cs.privValidatorPubKey == nil {
-		// Vote won't be signed, but it's not critical.
-		cs.Logger.Error(fmt.Sprintf("signAddVote: %v", errPubKeyIsNotSet))
-		return nil
-	}
-
-	// If the node not in the validator set, do nothing.
-	if !cs.Validators.HasAddress(cs.privValidatorPubKey.Address()) {
-		return nil
-	}
-
-	// TODO: pass pubKey to signVote
-	vote, err := cs.signVote(msgType, hash, header)
-	if err == nil {
-		cs.sendInternalMessage(msgInfo{&VoteMessage{vote}, ""})
-		cs.Logger.Debug("signed and pushed vote", "height", cs.Height, "round", cs.Round, "vote", vote)
-		return vote
-	}
-
-	cs.Logger.Error("failed signing vote", "height", cs.Height, "round", cs.Round, "vote", vote, "err", err)
-	return nil
-}
-
-// updatePrivValidatorPubKey get's the private validator public key and
-// memoizes it. This func returns an error if the private validator is not
-// responding or responds with an error.
-func (cs *State) updatePrivValidatorPubKey() error {
-	if cs.privValidator == nil {
-		return nil
-	}
-
-	pubKey, err := cs.privValidator.GetPubKey()
-	if err != nil {
-		return err
-	}
-	cs.privValidatorPubKey = pubKey
-	return nil
-}
-
-// look back to check existence of the node's consensus votes before joining consensus
-func (cs *State) checkDoubleSigningRisk(height int64) error {
-	if cs.privValidator != nil && cs.privValidatorPubKey != nil && cs.config.DoubleSignCheckHeight > 0 && height > 0 {
-		valAddr := cs.privValidatorPubKey.Address()
-		doubleSignCheckHeight := cs.config.DoubleSignCheckHeight
-		if doubleSignCheckHeight > height {
-			doubleSignCheckHeight = height
-		}
-
-		for i := int64(1); i < doubleSignCheckHeight; i++ {
-			lastCommit := cs.blockStore.LoadSeenCommit(height - i)
-			if lastCommit != nil {
-				for sigIdx, s := range lastCommit.Signatures {
-					if s.BlockIDFlag == types.BlockIDFlagCommit && bytes.Equal(s.ValidatorAddress, valAddr) {
-						cs.Logger.Info("found signature from the same key", "sig", s, "idx", sigIdx, "height", height-i)
-						return ErrSignatureFoundInPastBlocks
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func (cs *State) calculatePrevoteMessageDelayMetrics() {
-	if cs.Proposal == nil {
-		return
-	}
-
-	ps := cs.Votes.Prevotes(cs.Round)
-	pl := ps.List()
-
-	sort.Slice(pl, func(i, j int) bool {
-		return pl[i].Timestamp.Before(pl[j].Timestamp)
-	})
-
-	var votingPowerSeen int64
-	for _, v := range pl {
-		_, val := cs.Validators.GetByAddress(v.ValidatorAddress)
-		votingPowerSeen += val.VotingPower
-		if votingPowerSeen >= cs.Validators.TotalVotingPower()*2/3+1 {
-			cs.metrics.QuorumPrevoteMessageDelay.Set(v.Timestamp.Sub(cs.Proposal.Timestamp).Seconds())
-			break
-		}
-	}
-	if ps.HasAll() {
-		cs.metrics.FullPrevoteMessageDelay.Set(pl[len(pl)-1].Timestamp.Sub(cs.Proposal.Timestamp).Seconds())
-	}
-}
-
-//---------------------------------------------------------
-
-func CompareHRS(h1 int64, r1 int32, s1 cstypes.RoundStepType, h2 int64, r2 int32, s2 cstypes.RoundStepType) int {
-	if h1 < h2 {
-		return -1
-	} else if h1 > h2 {
-		return 1
-	}
-	if r1 < r2 {
-		return -1
-	} else if r1 > r2 {
-		return 1
-	}
-	if s1 < s2 {
-		return -1
-	} else if s1 > s2 {
-		return 1
-	}
-	return 0
-}
-
-// repairWalFile decodes messages from src (until the decoder errors) and
-// writes them to dst.
-func repairWalFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	var (
-		dec = NewWALDecoder(in)
-		enc = NewWALEncoder(out)
-	)
-
-	// best-case repair (until first error is encountered)
-	for {
-		msg, err := dec.Decode()
-		if err != nil {
-			break
-		}
-
-		err = enc.Encode(msg)
-		if err != nil {
-			return fmt.Errorf("failed to encode msg: %w", err)
-		}
-	}
-
-	return nil
+// GetProposerSelectionMode 현재 제안자 선택 모드 조회
+func (cs *State) GetProposerSelectionMode() ProposerSelectionMode {
+	cs.mtx.RLock()
+	defer cs.mtx.RUnlock()
+	return cs.proposerSelectionMode
 }
