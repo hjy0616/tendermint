@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"time"
 
-	cfg "github.com/tendermint/tendermint/config"
+	"github.com/tendermint/tendermint/cfg"
+	"github.com/tendermint/tendermint/clerk"
 	"github.com/tendermint/tendermint/consensus"
 	"github.com/tendermint/tendermint/crypto"
+	"github.com/tendermint/tendermint/evidence"
+	"github.com/tendermint/tendermint/indexer"
 	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
 	mempl "github.com/tendermint/tendermint/mempool"
 	"github.com/tendermint/tendermint/p2p"
 	"github.com/tendermint/tendermint/proxy"
 	sm "github.com/tendermint/tendermint/state"
-	"github.com/tendermint/tendermint/state/indexer"
-	"github.com/tendermint/tendermint/state/txindex"
+	"github.com/tendermint/tendermint/txindex"
 	"github.com/tendermint/tendermint/types"
 )
 
@@ -70,36 +72,49 @@ type peers interface {
 }
 
 // ----------------------------------------------
-// Environment contains objects and interfaces used by the RPC. It is expected
-// to be setup once during startup.
+// Environment contains objects and interfaces injected into the rpc environment,
+// providing developers with the means to customize the execution environment.
 type Environment struct {
 	// external, thread safe interfaces
-	ProxyAppQuery   proxy.AppConnQuery
-	ProxyAppMempool proxy.AppConnMempool
+	BlockStore       sm.BlockStore
+	StateStore       sm.Store
+	BlockExecutor    *sm.BlockExecutor
+	ConsensusState   *consensus.State
+	ConsensusReactor *consensus.Reactor
+	P2PPeers         p2p.Peers
+	P2PTransport     *p2p.Transport
 
 	// interfaces defined in types and above
-	StateStore     sm.Store
-	BlockStore     sm.BlockStore
-	EvidencePool   sm.EvidencePool
-	ConsensusState Consensus
-	P2PPeers       peers
-	P2PTransport   transport
+	Mempool      mempl.Mempool
+	EvidencePool evidence.Pool
+	ProxyApp     proxy.AppConns
 
 	// objects
-	PubKey           crypto.PubKey
-	GenDoc           *types.GenesisDoc // cache the genesis structure
-	TxIndexer        txindex.TxIndexer
-	BlockIndexer     indexer.BlockIndexer
-	ConsensusReactor *consensus.Reactor
-	EventBus         *types.EventBus // thread safe
-	Mempool          mempl.Mempool
-
 	Logger log.Logger
 
-	Config cfg.RPCConfig
+	// internal, thread safe services
+	EventBus       *types.EventBus
+	HistoricalInfo *sm.HistoricalInfo
+
+	// new services
+	ClerkService clerk.ClerkService
+
+	// metrics
+	Metrics *Metrics
+
+	// pub sub server
+	PubKey crypto.PubKey
 
 	// cache of chunked genesis data.
 	genChunks []string
+
+	// 기존 Environment 필드
+	ProxyAppQuery   proxy.AppConnQuery
+	ProxyAppMempool proxy.AppConnMempool
+	GenDoc          *types.GenesisDoc // cache the genesis structure
+	TxIndexer       txindex.TxIndexer
+	BlockIndexer    indexer.BlockIndexer
+	Config          cfg.RPCConfig
 }
 
 //----------------------------------------------

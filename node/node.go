@@ -19,6 +19,7 @@ import (
 	bcv0 "github.com/tendermint/tendermint/blockchain/v0"
 	bcv1 "github.com/tendermint/tendermint/blockchain/v1"
 	bcv2 "github.com/tendermint/tendermint/blockchain/v2"
+	"github.com/tendermint/tendermint/clerk"
 	cfg "github.com/tendermint/tendermint/config"
 	cs "github.com/tendermint/tendermint/consensus"
 	"github.com/tendermint/tendermint/crypto"
@@ -930,6 +931,29 @@ func NewNode(config *cfg.Config,
 	}
 	node.BaseService = *service.NewBaseService(logger, "Node", node)
 
+	// ClerkService 초기화
+	clerkDB, err := config.DBProvider(&DBContext{"clerkdb", config})
+	if err != nil {
+		return nil, err
+	}
+	clerkService := clerk.NewClerkService(
+		clerkDB,
+		clerk.WithLogger(logger.With("module", "clerk")),
+		clerk.WithMaxQueueSize(1000),
+		clerk.WithSyncInterval(60*time.Second),
+	)
+
+	env := &rpccore.Environment{
+		// 기존 필드들...
+		ClerkService: clerkService,
+	}
+
+	// ClerkService 시작
+	err = clerkService.Start()
+	if err != nil {
+		return nil, fmt.Errorf("failed to start clerk service: %w", err)
+	}
+
 	for _, option := range options {
 		option(node)
 	}
@@ -1057,6 +1081,11 @@ func (n *Node) OnStop() {
 		if err := n.stateStore.Close(); err != nil {
 			n.Logger.Error("problem closing statestore", "err", err)
 		}
+	}
+
+	if n.rpcEnvironment.ClerkService != nil {
+		n.Logger.Info("Stopping Clerk Service")
+		_ = n.rpcEnvironment.ClerkService.Stop()
 	}
 }
 
