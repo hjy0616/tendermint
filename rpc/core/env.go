@@ -1,3 +1,4 @@
+// Package core provides the core RPC functionality of Tendermint.
 package core
 
 import (
@@ -5,12 +6,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/tendermint/tendermint/cfg"
 	"github.com/tendermint/tendermint/clerk"
+	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/consensus"
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/evidence"
-	"github.com/tendermint/tendermint/indexer"
 	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
 	mempl "github.com/tendermint/tendermint/mempool"
@@ -18,7 +18,8 @@ import (
 	"github.com/tendermint/tendermint/p2p"
 	"github.com/tendermint/tendermint/proxy"
 	sm "github.com/tendermint/tendermint/state"
-	"github.com/tendermint/tendermint/txindex"
+	"github.com/tendermint/tendermint/state/indexer"
+	"github.com/tendermint/tendermint/state/txindex"
 	"github.com/tendermint/tendermint/types"
 )
 
@@ -58,13 +59,15 @@ type Consensus interface {
 	GetRoundStateSimpleJSON() ([]byte, error)
 }
 
-type transport interface {
+// Transport defines the interface for tendermint transport implementations.
+type Transport interface {
 	Listeners() []string
 	IsListening() bool
 	NodeInfo() p2p.NodeInfo
 }
 
-type peers interface {
+// PeerManager defines the interface for tendermint peer management.
+type PeerManager interface {
 	AddPersistentPeers([]string) error
 	AddUnconditionalPeerIDs([]string) error
 	AddPrivatePeerIDs([]string) error
@@ -82,8 +85,8 @@ type Environment struct {
 	BlockExecutor    *sm.BlockExecutor
 	ConsensusState   *consensus.State
 	ConsensusReactor *consensus.Reactor
-	P2PPeers         p2p.Peers
-	P2PTransport     *p2p.Transport
+	P2PPeers         PeerManager
+	P2PTransport     Transport
 
 	// interfaces defined in types and above
 	Mempool      mempl.Mempool
@@ -95,7 +98,7 @@ type Environment struct {
 
 	// internal, thread safe services
 	EventBus       *types.EventBus
-	HistoricalInfo *sm.HistoricalInfo
+	HistoricalInfo sm.State
 
 	// new services
 	ClerkService     clerk.ClerkService
@@ -110,13 +113,18 @@ type Environment struct {
 	// cache of chunked genesis data.
 	genChunks []string
 
-	// 기존 Environment 필드
+	// additional Environment fields
 	ProxyAppQuery   proxy.AppConnQuery
 	ProxyAppMempool proxy.AppConnMempool
 	GenDoc          *types.GenesisDoc // cache the genesis structure
 	TxIndexer       txindex.TxIndexer
 	BlockIndexer    indexer.BlockIndexer
-	Config          cfg.RPCConfig
+	Config          config.RPCConfig
+}
+
+// Metrics contains metrics exposed by the RPC server
+type Metrics struct {
+	// 메트릭스 필드 정의
 }
 
 //----------------------------------------------

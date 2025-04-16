@@ -1,5 +1,13 @@
 package coregrpc
 
+// 이 파일은 프로토버프에서 생성된 gRPC 코드를 임시로 대체합니다.
+// 실제 구현에서는 다음의 단계가 필요합니다:
+//
+// 1. tendermint/proto/tendermint/rpc/grpc/stream.proto 파일을 정의합니다.
+// 2. protoc를 사용하여 Go 코드를 생성합니다:
+//    protoc --go_out=. --go-grpc_out=. tendermint/proto/tendermint/rpc/grpc/stream.proto
+// 3. 이 파일의 임시 타입 선언 부분은 모두 제거하고 생성된 코드를 임포트합니다.
+
 import (
 	"context"
 	"io"
@@ -7,12 +15,135 @@ import (
 	"time"
 
 	"github.com/tendermint/tendermint/libs/log"
+	"github.com/tendermint/tendermint/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// TendermintStreamClient는 TendermintStreamService gRPC 서비스의 클라이언트입니다.
+//------------------------------------------------------------------------------
+// 임시 gRPC 클라이언트 인터페이스 및 타입 선언
+// 모든 타입 선언은 proto 파일을 컴파일하여 자동 생성된 코드로 대체되어야 합니다.
+//------------------------------------------------------------------------------
+
+// TendermintStreamServiceClient는 스트림 서비스의 클라이언트 인터페이스입니다.
+type TendermintStreamServiceClient interface {
+	SubscribeBlockEvents(ctx context.Context, in *RequestSubscribeBlockEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeBlockEventsClient, error)
+	SubscribeStateEvents(ctx context.Context, in *RequestSubscribeStateEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeStateEventsClient, error)
+	SubscribeValidatorEvents(ctx context.Context, in *RequestSubscribeValidatorEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeValidatorEventsClient, error)
+	SubscribeMempoolEvents(ctx context.Context, in *RequestSubscribeMempoolEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeMempoolEventsClient, error)
+}
+
+// 스트림 인터페이스 정의
+type TendermintStreamService_SubscribeBlockEventsClient interface {
+	Recv() (*ResponseBlockEvent, error)
+	grpc.ClientStream
+}
+
+type TendermintStreamService_SubscribeStateEventsClient interface {
+	Recv() (*ResponseStateEvent, error)
+	grpc.ClientStream
+}
+
+type TendermintStreamService_SubscribeValidatorEventsClient interface {
+	Recv() (*ResponseValidatorEvent, error)
+	grpc.ClientStream
+}
+
+type TendermintStreamService_SubscribeMempoolEventsClient interface {
+	Recv() (*ResponseMempoolEvent, error)
+	grpc.ClientStream
+}
+
+// 요청 타입 정의
+type RequestSubscribeBlockEvents struct {
+	StartHeight int64
+}
+
+type RequestSubscribeStateEvents struct {
+	RecordType string
+	FromTime   int64
+}
+
+type RequestSubscribeValidatorEvents struct {
+	StartHeight int64
+}
+
+type RequestSubscribeMempoolEvents struct{}
+
+// 응답 타입 정의
+type ResponseBlockEvent struct {
+	BlockInfo interface{} // 실제로는 *ResponseBlockInfo 타입
+	Timestamp int64
+}
+
+type ResponseStateEvent struct {
+	Records   []interface{} // 실제로는 []*EventRecord 타입
+	Timestamp int64
+}
+
+type ValidatorEvent struct {
+	Height            int64
+	AddedValidators   []*types.Validator
+	RemovedValidators []*types.Validator
+	UpdatedValidators []*types.Validator
+}
+
+type ResponseValidatorEvent struct {
+	Event     *ValidatorEvent
+	Timestamp int64
+}
+
+type MempoolEvent_EventType int32
+
+const (
+	MempoolEvent_ADDED   MempoolEvent_EventType = 0
+	MempoolEvent_REMOVED MempoolEvent_EventType = 1
+	MempoolEvent_RECHECK MempoolEvent_EventType = 2
+)
+
+type MempoolEvent struct {
+	Type      MempoolEvent_EventType
+	TxHash    []byte
+	TxData    []byte
+	Timestamp int64
+}
+
+type ResponseMempoolEvent struct {
+	Event     *MempoolEvent
+	Timestamp int64
+}
+
+// 임시 클라이언트 구현 - 실제로는 자동 생성된 코드로 대체됩니다
+func NewTendermintStreamServiceClient(cc *grpc.ClientConn) TendermintStreamServiceClient {
+	return &dummyTendermintStreamServiceClient{cc}
+}
+
+type dummyTendermintStreamServiceClient struct {
+	cc *grpc.ClientConn
+}
+
+func (c *dummyTendermintStreamServiceClient) SubscribeBlockEvents(ctx context.Context, in *RequestSubscribeBlockEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeBlockEventsClient, error) {
+	return nil, io.EOF // 임시 응답
+}
+
+func (c *dummyTendermintStreamServiceClient) SubscribeStateEvents(ctx context.Context, in *RequestSubscribeStateEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeStateEventsClient, error) {
+	return nil, io.EOF // 임시 응답
+}
+
+func (c *dummyTendermintStreamServiceClient) SubscribeValidatorEvents(ctx context.Context, in *RequestSubscribeValidatorEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeValidatorEventsClient, error) {
+	return nil, io.EOF // 임시 응답
+}
+
+func (c *dummyTendermintStreamServiceClient) SubscribeMempoolEvents(ctx context.Context, in *RequestSubscribeMempoolEvents, opts ...grpc.CallOption) (TendermintStreamService_SubscribeMempoolEventsClient, error) {
+	return nil, io.EOF // 임시 응답
+}
+
+//------------------------------------------------------------------------------
+// 실제 스트림 클라이언트 구현
+//------------------------------------------------------------------------------
+
+// TendermintStreamClient는 TendermintStreamService gRPC 서비스의 클라이언트 래퍼입니다.
 type TendermintStreamClient struct {
 	conn      *grpc.ClientConn
 	client    TendermintStreamServiceClient

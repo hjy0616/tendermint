@@ -1,71 +1,86 @@
 syntax = "proto3";
 package tendermint.rpc.grpc;
-option  go_package = "github.com/tendermint/tendermint/rpc/grpc;coregrpc";
+option go_package = "github.com/tendermint/tendermint/rpc/grpcgen;grpcgen";
 
-import "tendermint/abci/types.proto";
-import "tendermint/types/types.proto";
-import "tendermint/types/validator.proto";
-import "tendermint/types/block.proto";
+// TendermintService는 Tendermint 블록체인의 다양한 데이터를 조회하는 gRPC 서비스입니다.
+service TendermintService {
+  // 체크포인트 관련 메서드
+  rpc FetchCheckpoint(RequestFetchCheckpoint) returns (ResponseFetchCheckpoint) {}
+  rpc FetchCheckpointCount(RequestFetchCheckpointCount) returns (ResponseFetchCheckpointCount) {}
+  
+  // 마일스톤 관련 메서드
+  rpc FetchMilestone(RequestFetchMilestone) returns (ResponseFetchMilestone) {}
+  rpc FetchMilestoneCount(RequestFetchMilestoneCount) returns (ResponseFetchMilestoneCount) {}
+  rpc FetchNoAckMilestone(RequestFetchNoAckMilestone) returns (ResponseFetchNoAckMilestone) {}
+  
+  // 상태 동기화 관련 메서드
+  rpc StateSyncEvents(RequestStateSyncEvents) returns (ResponseStateSyncEvents) {}
+  rpc CommitStates(RequestCommitStates) returns (ResponseCommitStates) {}
+  
+  // 스팬 관련 메서드
+  rpc Span(RequestSpan) returns (ResponseSpan) {}
+  
+  // 블록체인 정보 관련 메서드
+  rpc BlockInfo(RequestBlockInfo) returns (ResponseBlockInfo) {}
+  
+  // Mempool information services
+  rpc MempoolInfo(RequestMempoolInfo) returns (ResponseMempoolInfo) {}
+}
 
-//----------------------------------------
-// Checkpoint Messages
-
+// 체크포인트 관련 메시지
 message RequestFetchCheckpoint {
   int64 checkpoint_number = 1;
 }
 
 message ResponseFetchCheckpoint {
-  bytes data = 1;
-  string root_hash = 2;
-  int64 start_block = 3;
-  int64 end_block = 4;
+  Checkpoint checkpoint = 1;
 }
 
-message RequestFetchCheckpointCount {
+message Checkpoint {
+  int64 number = 1;
+  bytes data = 2;
+  bytes root_hash = 3;
+  int64 start_block = 4;
+  int64 end_block = 5;
 }
+
+message RequestFetchCheckpointCount {}
 
 message ResponseFetchCheckpointCount {
   int64 count = 1;
 }
 
-//----------------------------------------
-// Milestone Messages
-
+// 마일스톤 관련 메시지
 message RequestFetchMilestone {
   int64 milestone_id = 1;
 }
 
 message ResponseFetchMilestone {
-  bytes data = 1;
-  string root_hash = 2;
-  int64 start_block = 3;
-  int64 end_block = 4;
+  Milestone milestone = 1;
 }
 
-message RequestFetchMilestoneCount {
+message Milestone {
+  int64 id = 1;
+  bytes data = 2;
+  bytes root_hash = 3;
+  int64 start_block = 4;
+  int64 end_block = 5;
+  bool ack = 6;
 }
+
+message RequestFetchMilestoneCount {}
 
 message ResponseFetchMilestoneCount {
   int64 count = 1;
 }
 
-message RequestFetchNoAckMilestone {
-}
+message RequestFetchNoAckMilestone {}
 
 message ResponseFetchNoAckMilestone {
   repeated int64 milestone_ids = 1;
 }
 
-//----------------------------------------
-// Clerk Messages
-
-message EventRecord {
-  uint64 id = 1;
-  int64 time = 2;
-  bytes data = 3;
-  string record_type = 4;
-}
-
+// 상태 동기화 관련 메시지
 message RequestStateSyncEvents {
   int64 from_time = 1;
   int64 to_time = 2;
@@ -73,7 +88,14 @@ message RequestStateSyncEvents {
 }
 
 message ResponseStateSyncEvents {
-  repeated EventRecord records = 1;
+  repeated Event events = 1;
+}
+
+message Event {
+  int64 id = 1;
+  int64 time = 2;
+  bytes data = 3;
+  string record_type = 4;
 }
 
 message RequestCommitStates {
@@ -81,76 +103,54 @@ message RequestCommitStates {
 }
 
 message ResponseCommitStates {
-  bool success = 1;
-  repeated int64 failed_event_ids = 2;
-  string error_message = 3;
+  repeated int64 failed_ids = 1;
 }
 
-//----------------------------------------
-// Span Messages
-
+// 스팬 관련 메시지
 message RequestSpan {
   int64 span_id = 1;
 }
 
 message ResponseSpan {
-  int64 span_id = 1;
-  int64 start_block = 2;
-  int64 end_block = 3;
-  repeated tendermint.types.Validator validators = 4;
-  repeated uint64 validator_powers = 5;
+  Span span = 1;
 }
 
-//----------------------------------------
-// Block Information Messages
+message Span {
+  int64 id = 1;
+  bytes data = 2;
+  int64 start_time = 3;
+  int64 end_time = 4;
+}
 
+// 블록체인 정보 관련 메시지
 message RequestBlockInfo {
   int64 height = 1;
 }
 
 message ResponseBlockInfo {
-  tendermint.types.Block block = 1;
-  string block_id = 2;
-  string app_hash = 3;
-  int64 last_commit_round = 4;
-  repeated string validators = 5;
+  BlockInfo block = 1;
 }
 
-//----------------------------------------
-// Mempool Information Messages
-
-message RequestMempoolInfo {
+message BlockInfo {
+  int64 height = 1;
+  bytes hash = 2;
+  bytes data = 3;
+  bytes app_hash = 4;
+  int64 time = 5;
+  int32 num_txs = 6;
 }
+
+message RequestMempoolInfo {}
 
 message ResponseMempoolInfo {
-  int64 size = 1;
-  int64 max_size = 2;
-  repeated bytes pending_txs = 3;
+  int32 tx_count = 1;
+  int64 total_size = 2;
+  repeated TxInfo txs_info = 3;
 }
 
-//----------------------------------------
-// Service Definition
-
-service TendermintService {
-  // Checkpoint services
-  rpc FetchCheckpoint(RequestFetchCheckpoint) returns (ResponseFetchCheckpoint);
-  rpc FetchCheckpointCount(RequestFetchCheckpointCount) returns (ResponseFetchCheckpointCount);
-  
-  // Milestone services
-  rpc FetchMilestone(RequestFetchMilestone) returns (ResponseFetchMilestone);
-  rpc FetchMilestoneCount(RequestFetchMilestoneCount) returns (ResponseFetchMilestoneCount);
-  rpc FetchNoAckMilestone(RequestFetchNoAckMilestone) returns (ResponseFetchNoAckMilestone);
-  
-  // Clerk services
-  rpc StateSyncEvents(RequestStateSyncEvents) returns (ResponseStateSyncEvents);
-  rpc CommitStates(RequestCommitStates) returns (ResponseCommitStates);
-  
-  // Span services
-  rpc Span(RequestSpan) returns (ResponseSpan);
-  
-  // Block information services
-  rpc BlockInfo(RequestBlockInfo) returns (ResponseBlockInfo);
-  
-  // Mempool information services
-  rpc MempoolInfo(RequestMempoolInfo) returns (ResponseMempoolInfo);
+message TxInfo {
+  bytes hash = 1;
+  int32 size = 2;
+  int64 gas_wanted = 3;
+  int64 gas_used = 4;
 } 

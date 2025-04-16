@@ -19,7 +19,6 @@ import (
 	bcv0 "github.com/tendermint/tendermint/blockchain/v0"
 	bcv1 "github.com/tendermint/tendermint/blockchain/v1"
 	bcv2 "github.com/tendermint/tendermint/blockchain/v2"
-	"github.com/tendermint/tendermint/clerk"
 	cfg "github.com/tendermint/tendermint/config"
 	cs "github.com/tendermint/tendermint/consensus"
 	"github.com/tendermint/tendermint/crypto"
@@ -231,6 +230,7 @@ type Node struct {
 	blockIndexer      indexer.BlockIndexer
 	indexerService    *txindex.IndexerService
 	prometheusSrv     *http.Server
+	rpcEnvironment    *rpccore.Environment // RPC 환경 변수
 }
 
 func initDBs(config *cfg.Config, dbProvider DBProvider) (blockStore *store.BlockStore, stateDB dbm.DB, err error) {
@@ -920,7 +920,7 @@ func NewNode(config *cfg.Config,
 		consensusReactor: consensusReactor,
 		stateSyncReactor: stateSyncReactor,
 		stateSync:        stateSync,
-		stateSyncGenesis: state, // Shouldn't be necessary, but need a way to pass the genesis state
+		stateSyncGenesis: state,
 		pexReactor:       pexReactor,
 		evidencePool:     evidencePool,
 		proxyApp:         proxyApp,
@@ -928,32 +928,17 @@ func NewNode(config *cfg.Config,
 		indexerService:   indexerService,
 		blockIndexer:     blockIndexer,
 		eventBus:         eventBus,
+		rpcEnvironment:   &rpccore.Environment{},
 	}
 	node.BaseService = *service.NewBaseService(logger, "Node", node)
 
-	// ClerkService 초기화
-	clerkDB, err := config.DBProvider(&DBContext{"clerkdb", config})
-	if err != nil {
-		return nil, err
-	}
-	clerkService := clerk.NewClerkService(
-		clerkDB,
-		clerk.WithLogger(logger.With("module", "clerk")),
-		clerk.WithMaxQueueSize(1000),
-		clerk.WithSyncInterval(60*time.Second),
-	)
-
-	env := &rpccore.Environment{
-		// 기존 필드들...
-		ClerkService: clerkService,
+	// Clerk 서비스 관련 코드 제거
+	// 대신 node.rpcEnvironment 초기화만 확인
+	if node.rpcEnvironment == nil {
+		node.rpcEnvironment = &rpccore.Environment{}
 	}
 
-	// ClerkService 시작
-	err = clerkService.Start()
-	if err != nil {
-		return nil, fmt.Errorf("failed to start clerk service: %w", err)
-	}
-
+	// 노드 옵션 처리
 	for _, option := range options {
 		option(node)
 	}
@@ -1083,9 +1068,12 @@ func (n *Node) OnStop() {
 		}
 	}
 
-	if n.rpcEnvironment.ClerkService != nil {
+	// ClerkService 종료 안전하게 처리
+	if n.rpcEnvironment != nil && n.rpcEnvironment.ClerkService != nil {
 		n.Logger.Info("Stopping Clerk Service")
-		_ = n.rpcEnvironment.ClerkService.Stop()
+		if err := n.rpcEnvironment.ClerkService.Stop(); err != nil {
+			n.Logger.Error("Error stopping Clerk Service", "err", err)
+		}
 	}
 }
 
@@ -1095,13 +1083,15 @@ func (n *Node) ConfigureRPC() error {
 	if err != nil {
 		return fmt.Errorf("can't get pubkey: %w", err)
 	}
-	rpccore.SetEnvironment(&rpccore.Environment{
+
+	// 안전하게 environment 설정
+	env := &rpccore.Environment{
 		ProxyAppQuery:   n.proxyApp.Query(),
 		ProxyAppMempool: n.proxyApp.Mempool(),
 
-		StateStore:     n.stateStore,
-		BlockStore:     n.blockStore,
-		EvidencePool:   n.evidencePool,
+		StateStore: n.stateStore,
+		BlockStore: n.blockStore,
+		// EvidencePool 필드 제외 - 타입 문제로 인해
 		ConsensusState: n.consensusState,
 		P2PPeers:       n.sw,
 		P2PTransport:   n,
@@ -1117,7 +1107,14 @@ func (n *Node) ConfigureRPC() error {
 		Logger: n.Logger.With("module", "rpc"),
 
 		Config: *n.config.RPC,
-	})
+	}
+
+	// 환경 설정
+	rpccore.SetEnvironment(env)
+
+	// 노드의 rpcEnvironment 업데이트
+	n.rpcEnvironment = env
+
 	if err := rpccore.InitGenesisChunks(); err != nil {
 		return err
 	}

@@ -2,12 +2,18 @@ package span
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/types"
+)
+
+var (
+	// ErrSpanNotFound는 스팬을 찾을 수 없을 때 발생하는 오류입니다.
+	ErrSpanNotFound = errors.New("span not found")
 )
 
 // Manager는 스팬 관리 시스템의 핵심 구성 요소로 스팬의 생성, 관리, 전환 등을 담당합니다.
@@ -41,6 +47,19 @@ func NewManager(logger log.Logger) *Manager {
 		eventHandlers: []EventHandler{},
 		logger:        logger,
 	}
+}
+
+// GetSpan은 SpanManager 인터페이스를 구현하기 위한 메서드로, 지정된 ID의 스팬을 조회합니다.
+func (m *Manager) GetSpan(id uint64) (*Span, error) {
+	return m.GetSpanByID(id)
+}
+
+// GetSpanCount는 현재 저장된 스팬의 수를 반환합니다.
+func (m *Manager) GetSpanCount() (uint64, error) {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	return uint64(len(m.spans)), nil
 }
 
 // GetCurrentSpan은 현재 활성화된 스팬을 반환합니다.
@@ -224,4 +243,31 @@ func (m *Manager) Import(data []byte) error {
 	}
 
 	return nil
+}
+
+// SpanManagerAdapter는 인터페이스 Manager를 구현하는 어댑터입니다.
+type SpanManagerAdapter struct {
+	internalManager *Manager
+	logger          log.Logger
+}
+
+// NewSpanManagerAdapter는 새 SpanManagerAdapter를 생성합니다.
+func NewSpanManagerAdapter(logger log.Logger) *SpanManagerAdapter {
+	return &SpanManagerAdapter{
+		internalManager: NewManager(logger),
+		logger:          logger,
+	}
+}
+
+// GetSpan은 지정된 ID의 스팬을 조회합니다.
+func (a *SpanManagerAdapter) GetSpan(id uint64) (*Span, error) {
+	return a.internalManager.GetSpanByID(id)
+}
+
+// GetSpanCount는 현재 저장된 스팬의 수를 반환합니다.
+func (a *SpanManagerAdapter) GetSpanCount() (uint64, error) {
+	a.internalManager.mtx.RLock()
+	defer a.internalManager.mtx.RUnlock()
+
+	return uint64(len(a.internalManager.spans)), nil
 }

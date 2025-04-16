@@ -1,26 +1,44 @@
 syntax = "proto3";
 package tendermint.rpc.grpc;
-option  go_package = "github.com/tendermint/tendermint/rpc/grpc;coregrpc";
+option go_package = "github.com/tendermint/tendermint/rpc/grpcgen;grpcgen";
 
-import "tendermint/abci/types.proto";
-import "tendermint/types/types.proto";
-import "tendermint/rpc/grpc/service.proto";
+// TendermintStreamService는 Tendermint 블록체인의 이벤트 스트림을 구독하는 gRPC 서비스입니다.
+service TendermintStreamService {
+  // 블록 이벤트 구독
+  rpc SubscribeBlockEvents(RequestSubscribeBlockEvents) returns (stream ResponseBlockEvent) {}
+  
+  // 상태 이벤트 구독
+  rpc SubscribeStateEvents(RequestSubscribeStateEvents) returns (stream ResponseStateEvent) {}
+  
+  // 검증자 이벤트 구독
+  rpc SubscribeValidatorEvents(RequestSubscribeValidatorEvents) returns (stream ResponseValidatorEvent) {}
+  
+  // 메모리풀 이벤트 구독
+  rpc SubscribeMempoolEvents(RequestSubscribeMempoolEvents) returns (stream ResponseMempoolEvent) {}
+}
 
-//----------------------------------------
-// Block Event Stream Messages
-
+// 블록 이벤트 관련 메시지
 message RequestSubscribeBlockEvents {
   int64 start_height = 1;
 }
 
 message ResponseBlockEvent {
-  ResponseBlockInfo block_info = 1;
+  BlockInfo block_info = 1;
   int64 timestamp = 2;
 }
 
-//----------------------------------------
-// State Event Stream Messages
+message BlockInfo {
+  int64 height = 1;
+  bytes hash = 2;
+  bytes data = 3;
+  bytes app_hash = 4;
+  int64 time = 5;
+  int32 num_txs = 6;
+  repeated string validators = 7;
+  int64 last_commit_round = 8;
+}
 
+// 상태 이벤트 관련 메시지
 message RequestSubscribeStateEvents {
   string record_type = 1;
   int64 from_time = 2;
@@ -31,18 +49,16 @@ message ResponseStateEvent {
   int64 timestamp = 2;
 }
 
-//----------------------------------------
-// Validator Event Stream Messages
-
-message RequestSubscribeValidatorEvents {
-  int64 start_height = 1;
+message EventRecord {
+  int64 id = 1;
+  int64 time = 2;
+  bytes data = 3;
+  string record_type = 4;
 }
 
-message ValidatorEvent {
-  int64 height = 1;
-  repeated tendermint.types.Validator added_validators = 2;
-  repeated tendermint.types.Validator removed_validators = 3;
-  repeated tendermint.types.Validator updated_validators = 4;
+// 검증자 이벤트 관련 메시지
+message RequestSubscribeValidatorEvents {
+  int64 start_height = 1;
 }
 
 message ResponseValidatorEvent {
@@ -50,10 +66,26 @@ message ResponseValidatorEvent {
   int64 timestamp = 2;
 }
 
-//----------------------------------------
-// Mempool Event Stream Messages
+message ValidatorEvent {
+  int64 height = 1;
+  repeated Validator added_validators = 2;
+  repeated Validator removed_validators = 3;
+  repeated Validator updated_validators = 4;
+}
 
-message RequestSubscribeMempoolEvents {
+message Validator {
+  bytes address = 1;
+  bytes pub_key = 2;
+  int64 voting_power = 3;
+  int64 proposer_priority = 4;
+}
+
+// 메모리풀 이벤트 관련 메시지
+message RequestSubscribeMempoolEvents {}
+
+message ResponseMempoolEvent {
+  MempoolEvent event = 1;
+  int64 timestamp = 2;
 }
 
 message MempoolEvent {
@@ -67,26 +99,4 @@ message MempoolEvent {
   bytes tx_hash = 2;
   bytes tx_data = 3;
   int64 timestamp = 4;
-}
-
-message ResponseMempoolEvent {
-  MempoolEvent event = 1;
-  int64 timestamp = 2;
-}
-
-//----------------------------------------
-// Stream Service Definition
-
-service TendermintStreamService {
-  // Subscribe to block events
-  rpc SubscribeBlockEvents(RequestSubscribeBlockEvents) returns (stream ResponseBlockEvent);
-  
-  // Subscribe to state events
-  rpc SubscribeStateEvents(RequestSubscribeStateEvents) returns (stream ResponseStateEvent);
-  
-  // Subscribe to validator events
-  rpc SubscribeValidatorEvents(RequestSubscribeValidatorEvents) returns (stream ResponseValidatorEvent);
-  
-  // Subscribe to mempool events
-  rpc SubscribeMempoolEvents(RequestSubscribeMempoolEvents) returns (stream ResponseMempoolEvent);
 } 
