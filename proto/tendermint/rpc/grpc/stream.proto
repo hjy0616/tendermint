@@ -1,0 +1,92 @@
+syntax = "proto3";
+package tendermint.rpc.grpc;
+option  go_package = "github.com/tendermint/tendermint/rpc/grpc;coregrpc";
+
+import "tendermint/abci/types.proto";
+import "tendermint/types/types.proto";
+import "tendermint/rpc/grpc/service.proto";
+
+//----------------------------------------
+// Block Event Stream Messages
+
+message RequestSubscribeBlockEvents {
+  int64 start_height = 1;
+}
+
+message ResponseBlockEvent {
+  ResponseBlockInfo block_info = 1;
+  int64 timestamp = 2;
+}
+
+//----------------------------------------
+// State Event Stream Messages
+
+message RequestSubscribeStateEvents {
+  string record_type = 1;
+  int64 from_time = 2;
+}
+
+message ResponseStateEvent {
+  repeated EventRecord records = 1;
+  int64 timestamp = 2;
+}
+
+//----------------------------------------
+// Validator Event Stream Messages
+
+message RequestSubscribeValidatorEvents {
+  int64 start_height = 1;
+}
+
+message ValidatorEvent {
+  int64 height = 1;
+  repeated tendermint.types.Validator added_validators = 2;
+  repeated tendermint.types.Validator removed_validators = 3;
+  repeated tendermint.types.Validator updated_validators = 4;
+}
+
+message ResponseValidatorEvent {
+  ValidatorEvent event = 1;
+  int64 timestamp = 2;
+}
+
+//----------------------------------------
+// Mempool Event Stream Messages
+
+message RequestSubscribeMempoolEvents {
+}
+
+message MempoolEvent {
+  enum EventType {
+    ADDED = 0;
+    REMOVED = 1;
+    RECHECK = 2;
+  }
+  
+  EventType type = 1;
+  bytes tx_hash = 2;
+  bytes tx_data = 3;
+  int64 timestamp = 4;
+}
+
+message ResponseMempoolEvent {
+  MempoolEvent event = 1;
+  int64 timestamp = 2;
+}
+
+//----------------------------------------
+// Stream Service Definition
+
+service TendermintStreamService {
+  // Subscribe to block events
+  rpc SubscribeBlockEvents(RequestSubscribeBlockEvents) returns (stream ResponseBlockEvent);
+  
+  // Subscribe to state events
+  rpc SubscribeStateEvents(RequestSubscribeStateEvents) returns (stream ResponseStateEvent);
+  
+  // Subscribe to validator events
+  rpc SubscribeValidatorEvents(RequestSubscribeValidatorEvents) returns (stream ResponseValidatorEvent);
+  
+  // Subscribe to mempool events
+  rpc SubscribeMempoolEvents(RequestSubscribeMempoolEvents) returns (stream ResponseMempoolEvent);
+} 
