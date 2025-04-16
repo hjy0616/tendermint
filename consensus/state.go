@@ -1118,6 +1118,9 @@ func (cs *State) enterPropose(height int64, round int32) {
 }
 
 func (cs *State) isProposer(address []byte) bool {
+	if cs.Validators.Size() == 0 {
+		return false
+	}
 	return bytes.Equal(cs.Validators.GetProposer().Address, address)
 }
 
@@ -1126,13 +1129,14 @@ func (cs *State) defaultDecideProposal(height int64, round int32) {
 	var blockParts *types.PartSet
 
 	// Decide on block
-	if cs.ValidBlock != nil {
-		// If there is valid block, choose that.
+	if cs.ValidRound > -1 {
+		// 이전 라운드에서 유효한 블록이 있다면 이를 다시 제안
 		block, blockParts = cs.ValidBlock, cs.ValidBlockParts
 	} else {
-		// Create a new proposal block from state/txs from the mempool.
+		// 새 블록 생성
 		block, blockParts = cs.createProposalBlock()
 		if block == nil {
+			cs.Logger.Error("Failed to create block proposal")
 			return
 		}
 	}
@@ -1143,24 +1147,25 @@ func (cs *State) defaultDecideProposal(height int64, round int32) {
 		cs.Logger.Error("failed flushing WAL to disk")
 	}
 
-	// Make proposal
+	// 제안 만들기
 	propBlockID := types.BlockID{Hash: block.Hash(), PartSetHeader: blockParts.Header()}
 	proposal := types.NewProposal(height, round, cs.ValidRound, propBlockID)
 	p := proposal.ToProto()
 	if err := cs.privValidator.SignProposal(cs.state.ChainID, p); err == nil {
 		proposal.Signature = p.Signature
 
-		// send proposal and block parts on internal msg queue
+		// 제안 전송
 		cs.sendInternalMessage(msgInfo{&ProposalMessage{proposal}, ""})
 
+		// 블록 부분들 전송
 		for i := 0; i < int(blockParts.Total()); i++ {
 			part := blockParts.GetPart(i)
 			cs.sendInternalMessage(msgInfo{&BlockPartMessage{cs.Height, cs.Round, part}, ""})
 		}
 
-		cs.Logger.Debug("signed proposal", "height", height, "round", round, "proposal", proposal)
+		cs.Logger.Info("Signed proposal", "height", height, "round", round, "proposal", proposal)
 	} else if !cs.replayMode {
-		cs.Logger.Error("propose step; failed signing proposal", "height", height, "round", round, "err", err)
+		cs.Logger.Error("Failed to sign proposal", "height", height, "round", round, "err", err)
 	}
 }
 
