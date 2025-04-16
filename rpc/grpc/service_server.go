@@ -284,10 +284,10 @@ func (s *TendermintServer) FetchCheckpoint(ctx context.Context, req *RequestFetc
 	return &ResponseFetchCheckpoint{
 		Checkpoint: &Checkpoint{
 			Number:     req.CheckpointNumber,
-			Data:       checkpoint.StateRootHash,
-			RootHash:   checkpoint.BlockHash,
-			StartBlock: int64(checkpoint.Height),
-			EndBlock:   int64(checkpoint.Height),
+			Data:       checkpoint.Data.StateRootHash,
+			RootHash:   checkpoint.Data.BlockHash,
+			StartBlock: int64(checkpoint.Data.Height),
+			EndBlock:   int64(checkpoint.Data.Height),
 		},
 	}, nil
 }
